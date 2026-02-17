@@ -1,9 +1,10 @@
+import os
 import time
 import numpy as np
-import torch
 import opuslib_next
 from config.logger import setup_logging
 from core.providers.vad.base import VADProviderBase
+from core.providers.vad.silero_onnx_wrapper import SileroOnnxWrapper
 
 TAG = __name__
 logger = setup_logging()
@@ -12,12 +13,10 @@ logger = setup_logging()
 class VADProvider(VADProviderBase):
     def __init__(self, config):
         logger.bind(tag=TAG).info("SileroVAD", config)
-        self.model, _ = torch.hub.load(
-            repo_or_dir=config["model_dir"],
-            source="local",
-            model="silero_vad",
-            force_reload=False,
+        onnx_path = os.path.join(
+            config["model_dir"], "src", "silero_vad", "data", "silero_vad.onnx"
         )
+        self.model = SileroOnnxWrapper(onnx_path)
 
         self.decoder = opuslib_next.Decoder(16000, 1)
 
@@ -47,7 +46,7 @@ class VADProvider(VADProviderBase):
         # 手动模式：直接返回True，不进行实时VAD检测，所有音频都缓存
         if conn.client_listen_mode == "manual":
             return True
-            
+
         try:
             pcm_frame = self.decoder.decode(opus_packet, 960)
             conn.client_audio_buffer.extend(pcm_frame)  # 将新数据加入缓冲区
@@ -59,14 +58,12 @@ class VADProvider(VADProviderBase):
                 chunk = conn.client_audio_buffer[: 512 * 2]
                 conn.client_audio_buffer = conn.client_audio_buffer[512 * 2 :]
 
-                # 转换为模型需要的张量格式
+                # 转换为模型需要的格式
                 audio_int16 = np.frombuffer(chunk, dtype=np.int16)
                 audio_float32 = audio_int16.astype(np.float32) / 32768.0
-                audio_tensor = torch.from_numpy(audio_float32)
 
-                # 检测语音活动
-                with torch.no_grad():
-                    speech_prob = self.model(audio_tensor, 16000).item()
+                # 检测语音活动（直接使用 numpy array）
+                speech_prob = self.model(audio_float32, 16000)
 
                 # 双阈值判断
                 if speech_prob >= self.vad_threshold:
