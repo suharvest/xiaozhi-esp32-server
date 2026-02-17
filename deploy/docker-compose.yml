@@ -1,0 +1,33 @@
+services:
+  xiaozhi-server:
+    image: xiaozhi-server:arm64
+    container_name: xiaozhi-server
+    restart: always
+    ports:
+      - "18000:8000"
+      - "18003:8003"
+    volumes:
+      - ./data:/opt/xiaozhi-esp32-server/data
+      - ./models:/opt/xiaozhi-esp32-server/models
+      - ./tmp:/opt/xiaozhi-esp32-server/tmp
+    environment:
+      - TZ=Asia/Shanghai
+    networks:
+      - xiaozhi-net
+
+  mcp-endpoint:
+    image: ghcr.nju.edu.cn/xinnan-tech/mcp-endpoint-server:latest
+    container_name: mcp-endpoint-server
+    restart: always
+    ports:
+      - "18004:8004"
+    volumes:
+      - ./mcp-data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+    networks:
+      - xiaozhi-net
+
+networks:
+  xiaozhi-net:
+    driver: bridge
