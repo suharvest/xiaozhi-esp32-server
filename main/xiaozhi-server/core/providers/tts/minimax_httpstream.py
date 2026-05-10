@@ -6,12 +6,14 @@ import asyncio
 import aiohttp
 import requests
 import traceback
+
+from core.utils import textUtils
 from config.logger import setup_logging
-from core.utils.tts import MarkdownCleaner
 from core.utils.util import parse_string_to_list
 from core.providers.tts.base import TTSProviderBase
-from core.utils import opus_encoder_utils, textUtils
 from core.providers.tts.dto.dto import SentenceType, ContentType
+from core.utils.tts import MarkdownCleaner, convert_percentage_to_range
+
 
 TAG = __name__
 logger = setup_logging()
@@ -55,6 +57,22 @@ class TTSProvider(TTSProviderBase):
 
         if self.voice:
             self.voice_setting["voice_id"] = self.voice
+
+        # 应用百分比调整（如果存在），否则使用公有化配置
+        if "ttsVolume" in config:
+            self.voice_setting["vol"] = round(convert_percentage_to_range(
+                config["ttsVolume"], min_val=0.1, max_val=10, base_val=1.0
+            ), 1)
+
+        if "ttsRate" in config:
+            self.voice_setting["speed"] = round(convert_percentage_to_range(
+                config["ttsRate"], min_val=0.5, max_val=2, base_val=1.0
+            ), 1)
+
+        if "ttsPitch" in config:
+            self.voice_setting["pitch"] = int(convert_percentage_to_range(
+                config["ttsPitch"], min_val=-12, max_val=12, base_val=0
+            ))
 
         self.host = "api.minimaxi.com"  # 备用地址：api-bj.minimaxi.com
         self.api_url = f"https://{self.host}/v1/t2a_v2?GroupId={self.group_id}"
@@ -130,22 +148,25 @@ class TTSProvider(TTSProviderBase):
     def to_tts_single_stream(self, text, is_last=False):
         try:
             max_repeat_time = 5
+            original_text = text
             text = MarkdownCleaner.clean_markdown(text)
+            if self._correct_words_pattern:
+                text = self._correct_words_pattern.sub(lambda m: self.correct_words[m.group(0)], text)
             try:
                 asyncio.run(self.text_to_speak(text, is_last))
             except Exception as e:
                 logger.bind(tag=TAG).warning(
-                    f"语音生成失败{5 - max_repeat_time + 1}次: {text}，错误: {e}"
+                    f"语音生成失败{5 - max_repeat_time + 1}次: {original_text}，错误: {e}"
                 )
                 max_repeat_time -= 1
 
             if max_repeat_time > 0:
                 logger.bind(tag=TAG).info(
-                    f"语音生成成功: {text}，重试{5 - max_repeat_time}次"
+                    f"语音生成成功: {original_text}，重试{5 - max_repeat_time}次"
                 )
             else:
                 logger.bind(tag=TAG).error(
-                    f"语音生成失败: {text}，请检查网络或服务是否正常"
+                    f"语音生成失败: {original_text}，请检查网络或服务是否正常"
                 )
         except Exception as e:
             logger.bind(tag=TAG).error(f"Failed to generate TTS file: {e}")
@@ -280,6 +301,8 @@ class TTSProvider(TTSProviderBase):
         """
         start_time = time.time()
         text = MarkdownCleaner.clean_markdown(text)
+        if self._correct_words_pattern:
+            text = self._correct_words_pattern.sub(lambda m: self.correct_words[m.group(0)], text)
 
         payload = {
             "model": self.model,

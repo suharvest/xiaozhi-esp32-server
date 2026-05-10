@@ -21,6 +21,7 @@ Hỗ trợ giao thức MQTT+UDP, giao thức Websocket, điểm truy cập MCP, 
   <a href="./README_en.md"><img alt="README in English" src="https://img.shields.io/badge/English-DFE0E5"></a>
   <a href="./README_vi.md"><img alt="Tiếng Việt" src="https://img.shields.io/badge/Tiếng Việt-DBEDFA"></a>
   <a href="./README_de.md"><img alt="Deutsch" src="https://img.shields.io/badge/Deutsch-DFE0E5"></a>
+  <a href="./README_pt_BR.md"><img alt="Português (Brasil)" src="https://img.shields.io/badge/Português (Brasil)-DFE0E5"></a>
   <a href="https://github.com/xinnan-tech/xiaozhi-esp32-server/releases">
     <img alt="GitHub Contributors" src="https://img.shields.io/github/v/release/xinnan-tech/xiaozhi-esp32-server?logo=docker" />
   </a>
@@ -212,8 +213,8 @@ Công cụ kiểm tra dịch vụ: https://2662r3426b.vicp.fun/test/
 |:---:|:---:|:---:|
 | ASR(Nhận dạng giọng nói) | FunASR(Local) | 👍XunfeiStreamASR(Xunfei Streaming) |
 | LLM(Mô hình lớn) | glm-4-flash(Zhipu) | 👍qwen-flash(Alibaba Bailian) |
-| VLLM(Mô hình lớn thị giác) | glm-4v-flash(Zhipu) | 👍qwen2.5-vl-3b-instructh(Alibaba Bailian) |
-| TTS(Tổng hợp giọng nói) | ✅LinkeraiTTS(Lingxi streaming) | 👍HuoshanDoubleStreamTTS(Volcano Streaming) |
+| VLLM(Mô hình lớn thị giác) | glm-4v-flash(Zhipu) | 👍qwen3.5-flash(Alibaba Bailian) |
+| TTS(Tổng hợp giọng nói) | EdgeTTS(Microsoft) | 👍HuoshanDoubleStreamTTS(Volcano Streaming) |
 | Intent(Nhận dạng ý định) | function_call(Gọi hàm) | function_call(Gọi hàm) |
 | Memory(Chức năng bộ nhớ) | mem_local_short(Bộ nhớ ngắn hạn cục bộ) | mem_local_short(Bộ nhớ ngắn hạn cục bộ) |
 
@@ -259,7 +260,7 @@ Nếu bạn là một nhà phát triển phần mềm, đây có một [Lá thư
 ---
 
 ## Hệ sinh thái sản phẩm 👬
-Xiaozhi là một hệ sinh thái, khi bạn sử dụng sản phẩm này, bạn cũng có thể xem các [dự án xuất sắc](https://github.com/78/xiaozhi-esp32?tab=readme-ov-file#related-open-source-projects) khác trong hệ sinh thái này
+Xiaozhi là một hệ sinh thái, khi bạn sử dụng sản phẩm này, bạn cũng có thể xem các [dự án xuất sắc](https://github.com/78/xiaozhi-esp32/blob/main/README_zh.md#%E7%9B%B8%E5%85%B3%E5%BC%80%E6%BA%90%E9%A1%B9%E7%9B%AE) khác trong hệ sinh thái này
 
 ---
 

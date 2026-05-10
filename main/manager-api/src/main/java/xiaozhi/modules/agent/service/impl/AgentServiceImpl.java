@@ -31,19 +31,24 @@ import xiaozhi.common.utils.ConvertUtils;
 import xiaozhi.common.utils.JsonUtils;
 import xiaozhi.common.utils.ToolUtil;
 import xiaozhi.modules.agent.dao.AgentDao;
+import xiaozhi.modules.agent.dao.AgentTagDao;
 import xiaozhi.modules.agent.dto.AgentCreateDTO;
 import xiaozhi.modules.agent.dto.AgentDTO;
+import xiaozhi.modules.agent.dto.AgentTagDTO;
 import xiaozhi.modules.agent.dto.AgentUpdateDTO;
 import xiaozhi.modules.agent.entity.AgentContextProviderEntity;
 import xiaozhi.modules.agent.entity.AgentEntity;
 import xiaozhi.modules.agent.entity.AgentPluginMapping;
+import xiaozhi.modules.agent.entity.AgentTagEntity;
 import xiaozhi.modules.agent.entity.AgentTemplateEntity;
 import xiaozhi.modules.agent.service.AgentChatHistoryService;
 import xiaozhi.modules.agent.service.AgentContextProviderService;
 import xiaozhi.modules.agent.service.AgentPluginMappingService;
 import xiaozhi.modules.agent.service.AgentService;
+import xiaozhi.modules.agent.service.AgentTagService;
 import xiaozhi.modules.agent.service.AgentTemplateService;
 import xiaozhi.modules.agent.vo.AgentInfoVO;
+import xiaozhi.modules.correctword.service.CorrectWordFileService;
 import xiaozhi.modules.device.entity.DeviceEntity;
 import xiaozhi.modules.device.service.DeviceService;
 import xiaozhi.modules.model.dto.ModelProviderDTO;
@@ -59,6 +64,7 @@ import xiaozhi.modules.timbre.service.TimbreService;
 @AllArgsConstructor
 public class AgentServiceImpl extends BaseServiceImpl<AgentDao, AgentEntity> implements AgentService {
     private final AgentDao agentDao;
+    private final AgentTagDao agentTagDao;
     private final TimbreService timbreModelService;
     private final ModelConfigService modelConfigService;
     private final RedisUtils redisUtils;
@@ -68,6 +74,8 @@ public class AgentServiceImpl extends BaseServiceImpl<AgentDao, AgentEntity> imp
     private final AgentTemplateService agentTemplateService;
     private final ModelProviderService modelProviderService;
     private final AgentContextProviderService agentContextProviderService;
+    private final AgentTagService agentTagService;
+    private final CorrectWordFileService correctWordFileService;
 
     @Override
     public PageData<AgentEntity> adminAgentList(Map<String, Object> params) {
@@ -97,6 +105,10 @@ public class AgentServiceImpl extends BaseServiceImpl<AgentDao, AgentEntity> imp
         if (contextProviderEntity != null) {
             agent.setContextProviders(contextProviderEntity.getContextProviders());
         }
+
+        // 查询替换词文件ID列表
+        List<String> correctWordFileIds = correctWordFileService.getAgentCorrectWordFileIds(id);
+        agent.setCorrectWordFileIds(correctWordFileIds);
 
         // 无需额外查询插件列表，已通过SQL查询出来
         return agent;
@@ -134,32 +146,32 @@ public class AgentServiceImpl extends BaseServiceImpl<AgentDao, AgentEntity> imp
         QueryWrapper<AgentEntity> queryWrapper = new QueryWrapper<>();
         queryWrapper.eq("user_id", userId).orderByDesc("created_at");
 
-        // 如果有搜索关键词，根据搜索类型添加相应的查询条件
         if (StringUtils.isNotBlank(keyword)) {
-            if ("mac".equals(searchType)) {
-                // 按MAC地址搜索：先搜索设备，再获取对应的智能体
+            queryWrapper.and(w -> {
+                // 按名称搜索
+                w.like("agent_name", keyword);
+
+                // 按MAC地址搜索：先查设备，再获取对应的智能体ID
                 List<DeviceEntity> devices = Optional
-                        .ofNullable(deviceService.searchDevicesByMacAddress(keyword, userId)).orElseGet(ArrayList::new);
-                // 获取设备对应的智能体ID列表
+                        .ofNullable(deviceService.searchDevicesByMacAddress(keyword, userId))
+                        .orElseGet(ArrayList::new);
                 List<String> agentIds = devices.stream()
                         .map(DeviceEntity::getAgentId)
                         .distinct()
                         .collect(Collectors.toList());
                 if (ToolUtil.isNotEmpty(agentIds)) {
-                    queryWrapper.in("id", agentIds);
-                } else {
-                    return new ArrayList<>();
+                    w.or().in("id", agentIds);
                 }
-            } else {
-                // 按名称搜索
-                queryWrapper.like("agent_name", keyword);
-            }
+
+                // 按标签名搜索
+                List<String> tagAgentIds = agentTagService.getAgentIdsByTagName(keyword);
+                if (ToolUtil.isNotEmpty(tagAgentIds)) {
+                    w.or().in("id", tagAgentIds);
+                }
+            });
         }
 
-        // 执行查询
         List<AgentEntity> agentEntities = baseDao.selectList(queryWrapper);
-
-        // 转换为DTO并设置所有必要字段
         return agentEntities.stream().map(this::buildAgentDTO).collect(Collectors.toList());
     }
 
@@ -193,6 +205,19 @@ public class AgentServiceImpl extends BaseServiceImpl<AgentDao, AgentEntity> imp
         // 获取设备数量
         dto.setDeviceCount(getDeviceCountByAgentId(agent.getId()));
 
+        // 获取标签列表
+        List<AgentTagEntity> tags = agentTagDao.selectByAgentId(agent.getId());
+        if (ToolUtil.isNotEmpty(tags)) {
+            dto.setTags(tags.stream().map(this::convertTagToDTO).collect(Collectors.toList()));
+        }
+
+        return dto;
+    }
+
+    private AgentTagDTO convertTagToDTO(AgentTagEntity entity) {
+        AgentTagDTO dto = new AgentTagDTO();
+        dto.setId(entity.getId());
+        dto.setTagName(entity.getTagName());
         return dto;
     }
 
@@ -273,6 +298,9 @@ public class AgentServiceImpl extends BaseServiceImpl<AgentDao, AgentEntity> imp
         if (dto.getLlmModelId() != null) {
             existingEntity.setLlmModelId(dto.getLlmModelId());
         }
+        if (dto.getSlmModelId() != null) {
+            existingEntity.setSlmModelId(dto.getSlmModelId());
+        }
         if (dto.getVllmModelId() != null) {
             existingEntity.setVllmModelId(dto.getVllmModelId());
         }
@@ -281,6 +309,18 @@ public class AgentServiceImpl extends BaseServiceImpl<AgentDao, AgentEntity> imp
         }
         if (dto.getTtsVoiceId() != null) {
             existingEntity.setTtsVoiceId(dto.getTtsVoiceId());
+        }
+        if (dto.getTtsLanguage() != null) {
+            existingEntity.setTtsLanguage(dto.getTtsLanguage());
+        }
+        if (dto.getTtsVolume() != null) {
+            existingEntity.setTtsVolume(dto.getTtsVolume());
+        }
+        if (dto.getTtsRate() != null) {
+            existingEntity.setTtsRate(dto.getTtsRate());
+        }
+        if (dto.getTtsPitch() != null) {
+            existingEntity.setTtsPitch(dto.getTtsPitch());
         }
         if (dto.getMemModelId() != null) {
             existingEntity.setMemModelId(dto.getMemModelId());
@@ -367,13 +407,14 @@ public class AgentServiceImpl extends BaseServiceImpl<AgentDao, AgentEntity> imp
         existingEntity.setUpdatedAt(new Date());
 
         // 更新记忆策略
-        if (existingEntity.getMemModelId() == null || existingEntity.getMemModelId().equals(Constant.MEMORY_NO_MEM)) {
-            // 删除所有记录
+        // 删除所有记录
+        if (existingEntity.getMemModelId() != null && existingEntity.getMemModelId().equals(Constant.MEMORY_NO_MEM)) {
             agentChatHistoryService.deleteByAgentId(existingEntity.getId(), true, true);
             existingEntity.setSummaryMemory("");
-        } else if (existingEntity.getChatHistoryConf() != null && existingEntity.getChatHistoryConf() == 1) {
-            // 删除音频数据
-            agentChatHistoryService.deleteByAgentId(existingEntity.getId(), true, false);
+            // 删除记忆
+        } else if (existingEntity.getMemModelId() != null
+                && existingEntity.getMemModelId().equals(Constant.MEMORY_MEM_REPORT_ONLY)) {
+            existingEntity.setSummaryMemory("");
         }
 
         // 更新上下文源配置
@@ -382,6 +423,11 @@ public class AgentServiceImpl extends BaseServiceImpl<AgentDao, AgentEntity> imp
             contextEntity.setAgentId(agentId);
             contextEntity.setContextProviders(dto.getContextProviders());
             agentContextProviderService.saveOrUpdateByAgentId(contextEntity);
+        }
+
+        // 更新替换词文件关联
+        if (dto.getCorrectWordFileIds() != null) {
+            correctWordFileService.saveAgentCorrectWords(agentId, dto.getCorrectWordFileIds());
         }
 
         boolean b = validateLLMIntentParams(dto.getLlmModelId(), dto.getIntentModelId());
@@ -466,6 +512,13 @@ public class AgentServiceImpl extends BaseServiceImpl<AgentDao, AgentEntity> imp
             entity.setLanguage(template.getLanguage());
         }
 
+        if (entity.getSlmModelId() == null) {
+            String defaultSlmModelId = getDefaultLLMModelId();
+            if (defaultSlmModelId != null) {
+                entity.setSlmModelId(defaultSlmModelId);
+            }
+        }
+
         // 设置用户ID和创建者信息
         UserDetail user = SecurityUser.getUser();
         entity.setUserId(user.getId());
@@ -502,6 +555,25 @@ public class AgentServiceImpl extends BaseServiceImpl<AgentDao, AgentEntity> imp
         // 保存默认插件
         agentPluginMappingService.saveBatch(toInsert);
         return entity.getId();
+    }
+
+    private String getDefaultLLMModelId() {
+        try {
+            List<ModelConfigEntity> llmConfigs = modelConfigService.getEnabledModelsByType("LLM");
+            if (llmConfigs == null || llmConfigs.isEmpty()) {
+                return null;
+            }
+
+            for (ModelConfigEntity config : llmConfigs) {
+                if (config.getIsDefault() != null && config.getIsDefault() == 1) {
+                    return config.getId();
+                }
+            }
+
+            return llmConfigs.get(0).getId();
+        } catch (Exception e) {
+            return null;
+        }
     }
 
 }

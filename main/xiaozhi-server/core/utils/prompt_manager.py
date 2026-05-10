@@ -119,7 +119,7 @@ class PromptManager:
         # 使用传入的提示词并缓存（如果有设备ID）
         if device_id:
             device_cache_key = f"device_prompt:{device_id}"
-            self.cache_manager.set(self.CacheType.CONFIG, device_cache_key, user_prompt)
+            self.cache_manager.set(self.CacheType.DEVICE_PROMPT, device_cache_key, user_prompt)
             self.logger.bind(tag=TAG).debug(f"设备 {device_id} 的提示词已缓存")
 
         self.logger.bind(tag=TAG).info(f"使用快速提示词: {user_prompt[:50]}...")
@@ -251,6 +251,15 @@ class PromptManager:
                         or ""
                     )
 
+            # 获取TTS选择的语言，默认值为中文
+            language = (
+                self.config.get("TTS", {})
+                .get(self.config.get("selected_module", {}).get("TTS", ""), {})
+                .get("language")
+                or "中文"
+            )
+            self.logger.bind(tag=TAG).debug(f"获取到选择的语言: {language}")
+
             # 替换模板变量
             template = Template(self.base_prompt_template)
             enhanced_prompt = template.render(
@@ -265,6 +274,7 @@ class PromptManager:
                 device_id=device_id,
                 client_ip=client_ip,
                 dynamic_context=self.context_data,
+                language=language,
                 *args,
                 **kwargs,
             )

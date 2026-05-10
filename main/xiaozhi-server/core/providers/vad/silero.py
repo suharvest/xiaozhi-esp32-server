@@ -1,10 +1,10 @@
-import os
 import time
+import os
 import numpy as np
 import opuslib_next
+import onnxruntime
 from config.logger import setup_logging
 from core.providers.vad.base import VADProviderBase
-from core.providers.vad.silero_onnx_wrapper import SileroOnnxWrapper
 
 TAG = __name__
 logger = setup_logging()
@@ -13,14 +13,17 @@ logger = setup_logging()
 class VADProvider(VADProviderBase):
     def __init__(self, config):
         logger.bind(tag=TAG).info("SileroVAD", config)
-        onnx_path = os.path.join(
+
+        model_path = os.path.join(
             config["model_dir"], "src", "silero_vad", "data", "silero_vad.onnx"
         )
-        self.model = SileroOnnxWrapper(onnx_path)
+        opts = onnxruntime.SessionOptions()
+        opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = 1
+        self.session = onnxruntime.InferenceSession(
+            model_path, providers=["CPUExecutionProvider"], sess_options=opts
+        )
 
-        self.decoder = opuslib_next.Decoder(16000, 1)
-
-        # 处理空字符串的情况
         threshold = config.get("threshold", "0.5")
         threshold_low = config.get("threshold_low", "0.2")
         min_silence_duration_ms = config.get("min_silence_duration_ms", "1000")
@@ -32,15 +35,25 @@ class VADProvider(VADProviderBase):
             int(min_silence_duration_ms) if min_silence_duration_ms else 1000
         )
 
-        # 至少要多少帧才算有语音
         self.frame_window_threshold = 3
 
-    def __del__(self):
-        if hasattr(self, 'decoder') and self.decoder is not None:
-            try:
-                del self.decoder
-            except Exception:
-                pass
+    def _init_connection_state(self, conn):
+        """为连接初始化独立的 VAD 状态"""
+        if not hasattr(conn, "_vad_opus_decoder"):
+            conn._vad_opus_decoder = opuslib_next.Decoder(16000, 1)
+        if not hasattr(conn, "_vad_state"):
+            conn._vad_state = np.zeros((2, 1, 128), dtype=np.float32)
+        if not hasattr(conn, "_vad_context"):
+            conn._vad_context = np.zeros((1, 64), dtype=np.float32)
+
+    def release_conn_resources(self, conn):
+        """释放连接的 VAD 资源（连接关闭时调用）"""
+        for attr in ("_vad_opus_decoder", "_vad_state", "_vad_context"):
+            if hasattr(conn, attr):
+                try:
+                    delattr(conn, attr)
+                except Exception:
+                    pass
 
     def is_vad(self, conn, opus_packet):
         # 手动模式：直接返回True，不进行实时VAD检测，所有音频都缓存
@@ -48,22 +61,32 @@ class VADProvider(VADProviderBase):
             return True
 
         try:
-            pcm_frame = self.decoder.decode(opus_packet, 960)
-            conn.client_audio_buffer.extend(pcm_frame)  # 将新数据加入缓冲区
+            self._init_connection_state(conn)
 
-            # 处理缓冲区中的完整帧（每次处理512采样点）
+            pcm_frame = conn._vad_opus_decoder.decode(opus_packet, 960)
+            conn.client_audio_buffer.extend(pcm_frame)
+
             client_have_voice = False
             while len(conn.client_audio_buffer) >= 512 * 2:
-                # 提取前512个采样点（1024字节）
                 chunk = conn.client_audio_buffer[: 512 * 2]
                 conn.client_audio_buffer = conn.client_audio_buffer[512 * 2 :]
 
-                # 转换为模型需要的格式
                 audio_int16 = np.frombuffer(chunk, dtype=np.int16)
                 audio_float32 = audio_int16.astype(np.float32) / 32768.0
+                audio_input = np.concatenate(
+                    [conn._vad_context, audio_float32.reshape(1, -1)], axis=1
+                ).astype(np.float32)
 
-                # 检测语音活动（直接使用 numpy array）
-                speech_prob = self.model(audio_float32, 16000)
+                ort_inputs = {
+                    "input": audio_input,
+                    "state": conn._vad_state,
+                    "sr": np.array(16000, dtype=np.int64),
+                }
+                out, state = self.session.run(None, ort_inputs)
+
+                conn._vad_state = state
+                conn._vad_context = audio_input[:, -64:]
+                speech_prob = out.item()
 
                 # 双阈值判断
                 if speech_prob >= self.vad_threshold:
@@ -84,12 +107,12 @@ class VADProvider(VADProviderBase):
 
                 # 如果之前有声音，但本次没有声音，且与上次有声音的时间差已经超过了静默阈值，则认为已经说完一句话
                 if conn.client_have_voice and not client_have_voice:
-                    stop_duration = time.time() * 1000 - conn.last_activity_time
+                    stop_duration = time.time() * 1000 - conn.vad_last_voice_time
                     if stop_duration >= self.silence_threshold_ms:
                         conn.client_voice_stop = True
                 if client_have_voice:
                     conn.client_have_voice = True
-                    conn.last_activity_time = time.time() * 1000
+                    conn.vad_last_voice_time = time.time() * 1000
 
             return client_have_voice
         except opuslib_next.OpusError as e:

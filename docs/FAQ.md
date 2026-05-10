@@ -40,8 +40,8 @@ conda install conda-forge::ffmpeg
 |:---:|:---:|:---:|
 | ASR(语音识别) | FunASR(本地) | 👍XunfeiStreamASR(讯飞流式) |
 | LLM(大模型) | glm-4-flash(智谱) | 👍qwen-flash(阿里百炼) |
-| VLLM(视觉大模型) | glm-4v-flash(智谱) | 👍qwen2.5-vl-3b-instructh(阿里百炼) |
-| TTS(语音合成) | ✅LinkeraiTTS(灵犀流式) | 👍HuoshanDoubleStreamTTS(火山流式) |
+| VLLM(视觉大模型) | glm-4v-flash(智谱) | 👍qwen3.5-flash(阿里百炼) |
+| TTS(语音合成) | EdgeTTS(微软) | 👍HuoshanDoubleStreamTTS(火山流式) |
 | Intent(意图识别) | function_call(函数调用) | function_call(函数调用) |
 | Memory(记忆功能) | mem_local_short(本地短期记忆） | mem_local_short（本地短期记忆） |
 
@@ -83,6 +83,7 @@ VAD:
 9、[知识库ragflow集成指南](./ragflow-integration.md)<br/>
 10、[如何部署上下文源](./context-provider-integration.md)<br/>
 11、[如何集成PowerMem智能记忆](./powermem-integration.md)<br/>
+12、[如何配置天气插件查询天气](./weather-integration.md)<br/>
 
 ### 11、语音克隆、本地语音部署相关教程
 1、[如何在智控台克隆音色](./huoshan-streamTTS-voice-cloning.md)<br/>

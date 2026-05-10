@@ -55,6 +55,9 @@
                 <el-dropdown-item @click.native="changeLanguage('vi')">
                   {{ $t("language.vi") }}
                 </el-dropdown-item>
+                <el-dropdown-item @click.native="changeLanguage('pt_BR')">
+                  {{ $t("language.ptBR") }}
+                </el-dropdown-item>
               </el-dropdown-menu>
             </el-dropdown>
           </div>
@@ -133,11 +136,11 @@
           </div>
           <div style="font-size: 14px; color: #979db1">
             {{ $t("login.agreeTo") }}
-            <div style="display: inline-block; color: #5778ff; cursor: pointer">
+            <div style="display: inline-block; color: #5778ff; cursor: pointer" @click="openPage('/user-agreement.html')">
               {{ $t("login.userAgreement") }}
             </div>
             {{ $t("login.and") }}
-            <div style="display: inline-block; color: #5778ff; cursor: pointer">
+            <div style="display: inline-block; color: #5778ff; cursor: pointer" @click="openPage('/privacy-policy.html')">
               {{ $t("login.privacyPolicy") }}
             </div>
           </div>
@@ -188,6 +191,8 @@ export default {
           return this.$t("language.de");
         case "vi":
           return this.$t("language.vi");
+        case "pt_BR":
+          return this.$t("language.ptBR");
         default:
           return this.$t("language.zhCN");
       }
@@ -233,18 +238,20 @@ export default {
     this.$store.dispatch("fetchPubConfig").then(() => {
       // 根据配置决定默认登录方式
       this.isMobileLogin = this.enableMobileRegister;
-      
-      // pub-config接口调用完成后，重新初始化featureManager以确保使用最新的配置
-      featureManager.waitForInitialization().then(() => {
-        console.log('featureManager重新初始化完成，使用pub-config配置');
-      }).catch(error => {
-        console.warn('featureManager重新初始化失败:', error);
-      });
     });
   },
   methods: {
+    openPage(url) {
+      const lang = this.$i18n ? this.$i18n.locale : 'zh_CN';
+      if (!lang.startsWith('zh')) {
+        url = url.replace('.html', '-en.html');
+      }
+      window.open(url, '_blank');
+    },
     fetchCaptcha() {
-      if (this.$store.getters.getToken) {
+      // 处理手动清空localstorage导致无法获取验证码的问题
+      const token = localStorage.getItem('token')
+      if (token) {
         if (this.$route.path !== "/home") {
           this.$router.push("/home");
         }
@@ -295,6 +302,17 @@ export default {
         return false;
       }
       return true;
+    },
+    
+    getUserInfo() {
+      Api.user.getUserInfo(({ data }) => {
+        if (data.code === 0) {
+          this.$store.commit("setUserInfo", data.data);
+          goToPage("/home");
+        } else {
+          showDanger("用户信息获取失败");
+        }
+      });
     },
 
     async login() {
@@ -349,20 +367,13 @@ export default {
         ({ data }) => {
           showSuccess(this.$t('login.loginSuccess'));
           this.$store.commit("setToken", JSON.stringify(data.data));
-          goToPage("/home");
+          this.getUserInfo();
         },
         (err) => {
           // 直接使用后端返回的国际化消息
           let errorMessage = err.data.msg || "登录失败";
 
           showDanger(errorMessage);
-          if (
-            err.data != null &&
-            err.data.msg != null &&
-            err.data.msg.indexOf("图形验证码") > -1 || err.data.msg.indexOf("Captcha") > -1
-          ) {
-            this.fetchCaptcha();
-          }
         }
       );
 

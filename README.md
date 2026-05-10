@@ -21,6 +21,7 @@
   <a href="./README_en.md"><img alt="README in English" src="https://img.shields.io/badge/English-DFE0E5"></a>
   <a href="./README_vi.md"><img alt="Tiếng Việt" src="https://img.shields.io/badge/Tiếng Việt-DFE0E5"></a>
   <a href="./README_de.md"><img alt="Deutsch" src="https://img.shields.io/badge/Deutsch-DFE0E5"></a>
+  <a href="./README_pt_BR.md"><img alt="Português (Brasil)" src="https://img.shields.io/badge/Português (Brasil)-DFE0E5"></a>
   <a href="https://github.com/xinnan-tech/xiaozhi-esp32-server/releases">
     <img alt="GitHub Contributors" src="https://img.shields.io/github/v/release/xinnan-tech/xiaozhi-esp32-server?logo=docker" />
   </a>
@@ -213,8 +214,8 @@ Websocket接口地址: wss://2662r3426b.vicp.fun/xiaozhi/v1/
 |:---:|:---:|:---:|
 | ASR(语音识别) | FunASR(本地) | 👍XunfeiStreamASR(讯飞流式) |
 | LLM(大模型) | glm-4-flash(智谱) | 👍qwen-flash(阿里百炼) |
-| VLLM(视觉大模型) | glm-4v-flash(智谱) | 👍qwen2.5-vl-3b-instructh(阿里百炼) |
-| TTS(语音合成) | ✅LinkeraiTTS(灵犀流式) | 👍HuoshanDoubleStreamTTS(火山流式) |
+| VLLM(视觉大模型) | glm-4v-flash(智谱) | 👍qwen3.5-flash(阿里百炼) |
+| TTS(语音合成) | EdgeTTS(微软) | 👍HuoshanDoubleStreamTTS(火山流式) |
 | Intent(意图识别) | function_call(函数调用) | function_call(函数调用) |
 | Memory(记忆功能) | mem_local_short(本地短期记忆） | mem_local_short（本地短期记忆） |
 

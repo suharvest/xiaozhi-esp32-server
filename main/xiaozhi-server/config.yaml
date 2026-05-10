@@ -61,6 +61,8 @@ delete_audio: true
 close_connection_no_voice_time: 120
 # TTS请求超时时间(秒)
 tts_timeout: 10
+# 工具调用超时时间(秒)
+tool_call_timeout: 30
 # 开启唤醒词加速
 enable_wakeup_words_response_cache: true
 # 开场是否回复唤醒词
@@ -394,7 +396,28 @@ ASR:
     type: doubao_stream
     appid: 你的火山引擎语音合成服务appid
     access_token: 你的火山引擎语音合成服务access_token
-    cluster: volcengine_input_common
+    # 资源ID：小时版 volc.bigasr.sauc.duration，并发版 volc.bigasr.sauc.concurrent
+    resource_id: volc.bigasr.sauc.duration
+    # 热词、替换词使用流程：https://www.volcengine.com/docs/6561/155738
+    boosting_table_name: （选填）你的热词文件名称
+    correct_table_name: （选填）你的替换词文件名称
+    # 是否开启多语种识别模式
+    enable_multilingual: False
+    # 多语种识别当该键为空时，该模型支持中英文、上海话、闽南语，四川、陕西、粤语识别。当将其设置为特定键时，它可以识别指定语言。
+    # 详细语言列表参考 https://www.volcengine.com/docs/6561/1354869
+    # language: zh-cn
+    # 静音判定时长(ms)，默认200ms
+    end_window_size: 200
+    output_dir: tmp/
+  DoubaoStreamASRV2:
+    # 豆包语音识别模型2.0（基于火山引擎seed-asr）
+    # 开通地址：https://console.volcengine.com/speech/service/10038
+    # 价格更为便宜，建议在高并发场景下使用
+    type: doubao_stream
+    appid: 你的火山引擎语音合成服务appid
+    access_token: 你的火山引擎语音合成服务access_token
+    # 资源ID：小时版 volc.seedasr.sauc.duration，并发版 volc.seedasr.sauc.concurrent
+    resource_id: volc.seedasr.sauc.duration
     # 热词、替换词使用流程：https://www.volcengine.com/docs/6561/155738
     boosting_table_name: （选填）你的热词文件名称
     correct_table_name: （选填）你的替换词文件名称
@@ -577,7 +600,7 @@ LLM:
     type: openai
     # 可在这里找到你的 api_key https://bailian.console.aliyun.com/?apiKey=1#/api-key
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    model_name: qwen-turbo
+    model_name: qwen-flash
     api_key: 你的deepseek web key
     temperature: 0.7  # 温度值
     max_tokens: 500   # 最大生成token数
@@ -712,7 +735,7 @@ VLLM:
     api_key: 你的api_key
   QwenVLVLLM:
     type: openai
-    model_name: qwen2.5-vl-3b-instruct
+    model_name: qwen3.5-flash
     url: https://dashscope.aliyuncs.com/compatible-mode/v1
     # 可在这里找到你的api key https://bailian.console.aliyun.com/?apiKey=1#/api-key
     api_key: 你的api_key
@@ -733,6 +756,7 @@ TTS:
     type: edge
     voice: zh-CN-XiaoxiaoNeural
     output_dir: tmp/
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   DoubaoTTS:
     # 定义TTS API类型
     type: doubao
@@ -751,6 +775,7 @@ TTS:
     speed_ratio: 1.0
     volume_ratio: 1.0
     pitch_ratio: 1.0
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   #火山tts，支持双向流式tts
   HuoshanDoubleStreamTTS:
     type: huoshan_double_stream
@@ -791,6 +816,32 @@ TTS:
     #       mix_factor: 0.3
     #     - source_speaker: zh_male_ahu_conversation_wvae_bigtts
     #       mix_factor: 0.4
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
+  #豆包语音合成模型2.0，支持双向流式tts（基于seed-tts-2.0资源）
+  HuoshanDoubleStreamTTSV2:
+    type: huoshan_double_stream
+    # 访问 https://console.volcengine.com/speech/service/10035 开通语音合成大模型，购买音色
+    # 在页面底部获取appid和access_token
+    # 资源ID固定为：seed-tts-2.0（豆包语音合成模型2.0）
+    # 如果是机智云，把接口地址换成wss://bytedance.gizwitsapi.com/api/v3/tts/bidirection
+    # 机智云不需要天填 appid
+    ws_url: wss://openspeech.bytedance.com/api/v3/tts/bidirection
+    appid: 你的火山引擎语音合成服务appid
+    access_token: 你的火山引擎语音合成服务access_token
+    resource_id: seed-tts-2.0
+    speaker: zh_female_xiaohe_uranus_bigtts
+    # 开启WebSocket连接复用，默认复用（注意：复用后设备处于聆听状态时空闲链接会占并发数）
+    enable_ws_reuse: True
+    # 相关参数文档：https://www.volcengine.com/docs/6561/1329505
+    # 音频输出配置（audio_params）- 用户可自定义添加火山引擎支持的任何音频参数
+    audio_params:
+      speech_rate: 0  # 语速(-50~100)
+      loudness_rate: 0  # 音量(-50~100)
+    # 高级文本处理配置（additions）- 用户可自定义添加火山引擎支持的任何高级参数
+    additions:
+      post_process:
+        pitch: 0  # 音高(-12~12)
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   CosyVoiceSiliconflow:
     type: siliconflow
     # 硅基流动TTS
@@ -800,6 +851,7 @@ TTS:
     output_dir: tmp/
     access_token: 你的硅基流动API密钥
     response_format: wav
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   CozeCnTTS:
     type: cozecn
     # COZECN TTS
@@ -808,6 +860,10 @@ TTS:
     output_dir: tmp/
     access_token: 你的coze web key
     response_format: wav
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
+    # 以下可不用设置，使用默认设置
+    # speed: 1  # 语速：-0.5到2
+    # loudness_rate: 0  # 音量：-50到100
   VolcesAiGatewayTTS:
     type: openai
     # 火山引擎 - 边缘大模型网关
@@ -822,6 +878,7 @@ TTS:
     voice: zh_male_shaonianzixin_moon_bigtts
     speed: 1
     output_dir: tmp/
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   FishSpeech:
     # 参照教程：https://github.com/xinnan-tech/xiaozhi-esp32-server/blob/main/docs/fish-speech-integration.md
     type: fishspeech
@@ -843,6 +900,7 @@ TTS:
     rate: 44100
     api_key: "你的api_key"
     api_url: "http://127.0.0.1:8080/v1/tts"
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   GPT_SOVITS_V2:
     # 定义TTS API类型
     #启动tts方法：
@@ -868,6 +926,7 @@ TTS:
     parallel_infer: true
     repetition_penalty: 1.35
     aux_ref_audio_paths: []
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   GPT_SOVITS_V3:
     # 定义TTS API类型 GPT-SoVITS-v3lora-20250228
     #启动tts方法：
@@ -887,6 +946,7 @@ TTS:
     inp_refs: []
     sample_steps: 32
     if_sr: false
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   MinimaxTTSHTTPStream:
   # Minimax流式语音合成服务
     type: minimax_httpstream
@@ -918,6 +978,7 @@ TTS:
     #     voice_id: female-shaonv
     #     weight: 1
     # language_boost: auto
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   AliyunTTS:
     # 阿里云智能语音交互服务，需要先在阿里云平台开通服务，然后获取验证信息
     # 平台地址：https://nls-portal.console.aliyun.com/
@@ -937,6 +998,7 @@ TTS:
     # volume: 50
     # speech_rate: 0
     # pitch_rate: 0
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   AliyunStreamTTS:
     # 阿里云CosyVoice大模型流式文本语音合成
     # 采用FlowingSpeechSynthesizer接口，支持更低延迟和更自然的语音质量
@@ -950,7 +1012,7 @@ TTS:
     output_dir: tmp/
     appkey: 你的阿里云智能语音交互服务项目Appkey
     token: 你的阿里云智能语音交互服务AccessToken，临时的24小时，要长期用下方的access_key_id，access_key_secret
-    voice: longxiaochun 
+    voice: longxiaochun
     access_key_id: 你的阿里云账号access_key_id
     access_key_secret: 你的阿里云账号access_key_secret
     # 截至2025年7月21日大模型音色只有北京节点采用，其他节点暂不支持
@@ -960,6 +1022,7 @@ TTS:
     # volume: 50  # 音量：0-100
     # speech_rate: 0  # 语速：-500到500
     # pitch_rate: 0  # 语调：-500到500
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   TencentTTS:
     # 腾讯云智能语音交互服务，需要先在腾讯云平台开通服务
     # appid、secret_id、secret_key申请地址：https://console.cloud.tencent.com/cam/capi
@@ -971,7 +1034,11 @@ TTS:
     secret_key: 你的腾讯云SecretKey
     region: ap-guangzhou
     voice: 101001
-
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
+    # 以下可不用设置，使用默认设置
+    # format: wav  # 音频格式：pcm、wav、mp3
+    # volume: 0  # 音量：-10到10
+    # speech_rate: 0  # 语速：-2到6
   TTS302AI:
     # 302AI语音合成服务，需要先在302平台创建账户充值，并获取密钥信息
     # 添加 302.ai TTS 配置
@@ -985,34 +1052,7 @@ TTS:
     voice: "zh_female_wanwanxiaohe_moon_bigtts"
     output_dir: tmp/
     access_token: "你的302API密钥"
-  GizwitsTTS:
-    type: doubao
-    # 火山引擎作为基座，可以完全使用企业级火山引擎语音合成服务
-    # 前一万名注册的用户，将送5元体验金额
-    # 获取API Key地址：https://agentrouter.gizwitsapi.com/panel/token
-    api_url: https://bytedance.gizwitsapi.com/api/v1/tts
-    authorization: "Bearer "
-    # 湾湾小何音色
-    voice: "zh_female_wanwanxiaohe_moon_bigtts"
-    output_dir: tmp/
-    access_token: "你的机智云API key"
-  ACGNTTS:
-    #在线网址：https://acgn.ttson.cn/
-    #token购买：www.ttson.cn
-    #开发相关疑问请提交至网站上的qq
-    #角色id获取地址：ctrl+f快速检索角色——网站管理者不允许发布,可询问网站管理者
-    #各参数意义见开发文档：https://www.yuque.com/alexuh/skmti9/wm6taqislegb02gd?singleDoc#
-    type: ttson
-    token: your_token
-    voice_id: 1695
-    speed_factor: 1
-    pitch_factor: 0
-    volume_change_dB: 0
-    to_lang: ZH
-    url: https://u95167-bd74-2aef8085.westx.seetacloud.com:8443/flashsummary/tts?token=
-    format: mp3
-    output_dir: tmp/
-    emotion: 1
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   OpenAITTS:
     # openai官方文本转语音服务，可支持全球大多数语种
     type: openai
@@ -1028,6 +1068,7 @@ TTS:
     # 语速范围0.25-4.0
     speed: 1
     output_dir: tmp/
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   CustomTTS:
     # 自定义的TTS接口服务，请求参数可自定义，可接入众多TTS服务
     # 以本地部署的KokoroTTS为例
@@ -1050,17 +1091,7 @@ TTS:
       # Authorization: Bearer xxxx
     format: mp3 # 接口返回的音频格式
     output_dir: tmp/
-  LinkeraiTTS:
-    type: linkerai
-    api_url: https://tts.linkerai.cn/tts
-    audio_format: "pcm"
-    # 默认的access_token供大家测试时免费使用的，此access_token请勿用于商业用途
-    # 如果效果不错，可自行申请token，申请地址：https://linkerai.cn
-    # 各参数意义见开发文档：https://tts.linkerai.cn/docs
-    # 支持声音克隆，可自行上传音频，填入voice参数，voice参数为空时，使用默认声音
-    access_token: "U4YdYXVfpwWnk2t5Gp822zWPCuORyeJL"
-    voice: "OUeAo1mhq6IBExi"
-    output_dir: tmp/
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   PaddleSpeechTTS:
     #百度飞浆 PaddleSpeech 支持本地离线部署 支持模型训练
     #框架地址 https://www.paddlepaddle.org.cn/
@@ -1074,6 +1105,7 @@ TTS:
     speed: 1.0  # 语速，1.0 表示正常语速，>1 表示加快，<1 表示减慢
     volume: 1.0  # 音量，1.0 表示正常音量，>1 表示增大，<1 表示减小
     save_path:   # 保存路径
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   IndexStreamTTS:
     # 基于Index-TTS-vLLM项目的TTS接口服务
     # 参照教程：https://github.com/Ksuriuri/index-tts-vllm/blob/master/README.md
@@ -1083,6 +1115,7 @@ TTS:
     # 默认音色，如需其他音色可到项目assets文件夹下注册
     voice: "jay_klee"
     output_dir: tmp/
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   AliBLTTS:
     # 阿里百炼CosyVoice大模型流式文本语音合成
     # 可在这里找到你的 api_key https://bailian.console.aliyun.com/?apiKey=1#/api-key
@@ -1097,6 +1130,7 @@ TTS:
     # volume: 50  # 音量：0-100
     # rate: 1  # 语速：0.5~2
     # pitch: 1  # 语调：0.5~2
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
   XunFeiTTS:
     # 讯飞TTS服务 官方网站：https://www.xfyun.cn/
     # 登录讯飞语音技术平台 https://console.xfyun.cn/app/myapp 创建相关应用
@@ -1118,3 +1152,4 @@ TTS:
     # volume: 50  # 音量：0-100
     # speed: 50  # 语速：0-100
     # pitch: 50  # 语调：0-100
+    # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文

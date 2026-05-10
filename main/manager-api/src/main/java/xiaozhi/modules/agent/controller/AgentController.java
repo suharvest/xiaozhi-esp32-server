@@ -42,6 +42,9 @@ import xiaozhi.modules.agent.dto.AgentMemoryDTO;
 import xiaozhi.modules.agent.dto.AgentUpdateDTO;
 import xiaozhi.modules.agent.entity.AgentEntity;
 import xiaozhi.modules.agent.entity.AgentTemplateEntity;
+import xiaozhi.modules.agent.dto.AgentTagDTO;
+import xiaozhi.modules.agent.entity.AgentTagEntity;
+import xiaozhi.modules.agent.service.AgentTagService;
 import xiaozhi.modules.agent.service.AgentChatAudioService;
 import xiaozhi.modules.agent.service.AgentChatHistoryService;
 import xiaozhi.modules.agent.service.AgentChatSummaryService;
@@ -49,6 +52,7 @@ import xiaozhi.modules.agent.service.AgentContextProviderService;
 import xiaozhi.modules.agent.service.AgentPluginMappingService;
 import xiaozhi.modules.agent.service.AgentService;
 import xiaozhi.modules.agent.service.AgentTemplateService;
+import xiaozhi.modules.correctword.service.CorrectWordFileService;
 import xiaozhi.modules.agent.vo.AgentChatHistoryUserVO;
 import xiaozhi.modules.agent.vo.AgentInfoVO;
 import xiaozhi.modules.device.entity.DeviceEntity;
@@ -69,6 +73,8 @@ public class AgentController {
     private final AgentContextProviderService agentContextProviderService;
     private final AgentChatSummaryService agentChatSummaryService;
     private final RedisUtils redisUtils;
+    private final AgentTagService agentTagService;
+    private final CorrectWordFileService correctWordFileService;
 
     @GetMapping("/list")
     @Operation(summary = "获取用户智能体列表")
@@ -77,7 +83,7 @@ public class AgentController {
             @RequestParam(value = "keyword", required = false) String keyword,
             @RequestParam(value = "searchType", defaultValue = "name") String searchType) {
         UserDetail user = SecurityUser.getUser();
-        
+
         // 直接调用整合后的getUserAgents方法，无需再区分搜索和普通查询
         List<AgentDTO> agents = agentService.getUserAgents(user.getId(), keyword, searchType);
         return new Result<List<AgentDTO>>().ok(agents);
@@ -146,6 +152,13 @@ public class AgentController {
         }
     }
 
+    @PostMapping("/chat-title/{sessionId}/generate")
+    @Operation(summary = "根据会话ID生成聊天标题")
+    public Result<Void> generateAndSaveChatTitle(@PathVariable String sessionId) {
+        agentChatSummaryService.generateAndSaveChatTitle(sessionId);
+        return new Result<Void>().ok(null);
+    }
+
     @PutMapping("/{id}")
     @Operation(summary = "更新智能体")
     @RequiresPermissions("sys:role:normal")
@@ -166,6 +179,8 @@ public class AgentController {
         agentPluginMappingService.deleteByAgentId(id);
         // 删除关联的上下文源配置
         agentContextProviderService.deleteByAgentId(id);
+        // 删除关联的替换词文件关联记录
+        correctWordFileService.deleteMappingsByAgentId(id);
         // 再删除智能体
         agentService.deleteById(id);
         return new Result<>();
@@ -275,6 +290,50 @@ public class AgentController {
                 .body(audioData);
     }
 
+    @PostMapping("/tag")
+    @Operation(summary = "创建标签")
+    @RequiresPermissions("sys:role:normal")
+    public Result<AgentTagEntity> createTag(@RequestBody Map<String, String> params) {
+        String tagName = params.get("tagName");
+        if (StringUtils.isBlank(tagName)) {
+            return new Result<AgentTagEntity>().error("标签名称不能为空");
+        }
+        AgentTagEntity tag = agentTagService.saveTag(tagName);
+        return new Result<AgentTagEntity>().ok(tag);
+    }
 
+    @GetMapping("/tag/list")
+    @Operation(summary = "获取所有标签列表")
+    @RequiresPermissions("sys:role:normal")
+    public Result<List<AgentTagDTO>> getAllTags() {
+        List<AgentTagDTO> tags = agentTagService.getAllTags();
+        return new Result<List<AgentTagDTO>>().ok(tags);
+    }
+
+    @DeleteMapping("/tag/{id}")
+    @Operation(summary = "删除标签")
+    @RequiresPermissions("sys:role:normal")
+    public Result<Void> deleteTag(@PathVariable String id) {
+        agentTagService.deleteTag(id);
+        return new Result<Void>().ok(null);
+    }
+
+    @GetMapping("/{id}/tags")
+    @Operation(summary = "获取智能体的标签")
+    @RequiresPermissions("sys:role:normal")
+    public Result<List<AgentTagDTO>> getAgentTags(@PathVariable String id) {
+        List<AgentTagDTO> tags = agentTagService.getTagsByAgentId(id);
+        return new Result<List<AgentTagDTO>>().ok(tags);
+    }
+
+    @PutMapping("/{id}/tags")
+    @Operation(summary = "保存智能体的标签")
+    @RequiresPermissions("sys:role:normal")
+    public Result<Void> saveAgentTags(@PathVariable String id, @RequestBody Map<String, Object> params) {
+        List<String> tagIds = (List<String>) params.get("tagIds");
+        List<String> tagNames = (List<String>) params.get("tagNames");
+        agentTagService.saveAgentTags(id, tagIds, tagNames);
+        return new Result<Void>().ok(null);
+    }
 
 }

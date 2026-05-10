@@ -10,6 +10,7 @@ TTS上报功能已集成到ConnectionHandler类中。
 """
 
 import time
+import json
 import opuslib_next
 from typing import TYPE_CHECKING
 
@@ -26,7 +27,7 @@ async def report(conn: "ConnectionHandler", type, text, opus_data, report_time):
 
     Args:
         conn: 连接对象
-        type: 上报类型，1为用户，2为智能体
+        type: 上报类型，1为用户，2为智能体，3为工具调用
         text: 合成文本
         opus_data: opus音频数据
         report_time: 上报时间
@@ -119,17 +120,56 @@ def enqueue_tts_report(conn: "ConnectionHandler", text, opus_data):
     try:
         # 使用连接对象的队列，传入文本和二进制数据而非文件路径
         if conn.chat_history_conf == 2:
-            conn.report_queue.put((2, text, opus_data, int(time.time())))
+            conn.report_queue.put((2, text, opus_data, int(time.time() * 1000)))
             conn.logger.bind(tag=TAG).debug(
                 f"TTS数据已加入上报队列: {conn.device_id}, 音频大小: {len(opus_data)} "
             )
         else:
-            conn.report_queue.put((2, text, None, int(time.time())))
+            conn.report_queue.put((2, text, None, int(time.time() * 1000)))
             conn.logger.bind(tag=TAG).debug(
                 f"TTS数据已加入上报队列: {conn.device_id}, 不上报音频"
             )
     except Exception as e:
         conn.logger.bind(tag=TAG).error(f"加入TTS上报队列失败: {text}, {e}")
+
+
+def enqueue_tool_report(conn: "ConnectionHandler", tool_name: str, tool_input: dict, tool_result: str = None, report_tool_call: bool = True):
+    """将工具调用数据加入上报队列
+
+    Args:
+        conn: 连接对象
+        tool_name: 工具名称
+        tool_input: 工具输入参数
+        tool_result: 工具执行结果（可选）
+        report_tool_call: 是否上报工具调用本身，默认True；仅上报结果时设为False
+    """
+    if not conn.read_config_from_api or conn.need_bind:
+        return
+    if conn.chat_history_conf == 0:
+        return
+
+    try:
+        timestamp = int(time.time() * 1000)
+
+        # 构建工具调用内容
+        if report_tool_call:
+            tool_text = json.dumps(
+                [
+                    {
+                        "type": "tool",
+                        "text": f"{tool_name}({json.dumps(tool_input, ensure_ascii=False)})",
+                    }
+                ]
+            )
+            conn.report_queue.put((3, tool_text, None, timestamp))
+
+        # 构建工具结果内容
+        if tool_result:
+            result_display = f'{{"result":"{str(tool_result)}"}}'
+            result_content = json.dumps([{"type": "tool_result", "text": result_display}], ensure_ascii=False)
+            conn.report_queue.put((3, result_content, None, timestamp + 1))
+    except Exception as e:
+        conn.logger.bind(tag=TAG).error(f"加入工具上报队列失败: {e}")
 
 
 def enqueue_asr_report(conn: "ConnectionHandler", text, opus_data):
@@ -147,12 +187,12 @@ def enqueue_asr_report(conn: "ConnectionHandler", text, opus_data):
     try:
         # 使用连接对象的队列，传入文本和二进制数据而非文件路径
         if conn.chat_history_conf == 2:
-            conn.report_queue.put((1, text, opus_data, int(time.time())))
+            conn.report_queue.put((1, text, opus_data, int(time.time() * 1000)))
             conn.logger.bind(tag=TAG).debug(
                 f"ASR数据已加入上报队列: {conn.device_id}, 音频大小: {len(opus_data)} "
             )
         else:
-            conn.report_queue.put((1, text, None, int(time.time())))
+            conn.report_queue.put((1, text, None, int(time.time() * 1000)))
             conn.logger.bind(tag=TAG).debug(
                 f"ASR数据已加入上报队列: {conn.device_id}, 不上报音频"
             )

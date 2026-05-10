@@ -130,15 +130,41 @@ class MarkdownCleaner:
         """
         主入口方法：依序执行所有正则，移除或替换 Markdown 元素
         """
-        # 检查文本是否全为英文和基本标点符号
-        if text and all((c.isascii() or c.isspace() or c in punctuation_set) for c in text):
-            # 保留原始空格，直接返回
-            return text
-
         for regex, replacement in MarkdownCleaner.REGEXES:
             text = regex.sub(replacement, text)
 
         # 去除emoji表情
         text = check_emoji(text)
 
+        # 检查文本是否全为英文和基本标点符号
+        if text and all((c.isascii() or c.isspace() or c in punctuation_set) for c in text):
+            # 保留原始空格，直接返回
+            return text
+
         return text.strip()
+
+def convert_percentage_to_range(percentage, min_val, max_val, base_val=None):
+    """
+    将百分比(-100~100)转换为指定范围的值
+
+    Args:
+        percentage: 百分比值 (-100 到 100)
+        min_val: 目标范围最小值
+        max_val: 目标范围最大值
+        base_val: 基准值（可选，默认为范围中点）
+
+    Returns:
+        转换后的值
+    """
+    percentage, min_val, max_val = float(percentage), float(min_val), float(max_val)
+    base_val = float(base_val) if base_val is not None else (min_val + max_val) / 2
+
+    if percentage < 0:
+        # 负百分比：从 base_val 向 min_val 线性插值
+        result = base_val + (base_val - min_val) * (percentage / 100)
+    else:
+        # 正百分比：从 base_val 向 max_val 线性插值
+        result = base_val + (max_val - base_val) * (percentage / 100)
+
+    # 确保结果在有效范围内
+    return max(min_val, min(max_val, result))

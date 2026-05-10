@@ -314,7 +314,7 @@ export default {
         if (res.data.code === 0) {
           this.mcpUrl = res.data.data || "";
         } else {
-          this.mcpUrl = "";
+          this.mcpUrl = res.data.msg;
           console.error('获取MCP地址失败:', res.data.msg);
         }
       });
@@ -477,13 +477,15 @@ export default {
 
 .function-column {
   position: relative;
+  display: flex;
+  flex-direction: column;
   width: auto;
-  height:700px; 
+  height: 100%; 
   padding: 10px;
-  overflow-y: auto;
   border-right: 1px solid #EBEEF5;
   scrollbar-width: none;
   overflow-x: hidden;
+  box-sizing: border-box;
 }
 
 .mcp-access-point {
@@ -497,6 +499,9 @@ export default {
 }
 
 .function-list {
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
   display: flex;
   flex-direction: column;
   gap: 8px;

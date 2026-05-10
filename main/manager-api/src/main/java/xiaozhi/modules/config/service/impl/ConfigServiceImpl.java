@@ -1,10 +1,12 @@
 package xiaozhi.modules.config.service.impl;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.stream.Collectors;
 
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.stereotype.Service;
@@ -30,7 +32,9 @@ import xiaozhi.modules.agent.service.AgentMcpAccessPointService;
 import xiaozhi.modules.agent.service.AgentPluginMappingService;
 import xiaozhi.modules.agent.service.AgentService;
 import xiaozhi.modules.agent.service.AgentTemplateService;
+import xiaozhi.modules.correctword.service.CorrectWordFileService;
 import xiaozhi.modules.agent.vo.AgentVoicePrintVO;
+import xiaozhi.modules.correctword.vo.CorrectWordSimpleVO;
 import xiaozhi.modules.config.service.ConfigService;
 import xiaozhi.modules.device.entity.DeviceEntity;
 import xiaozhi.modules.device.service.DeviceService;
@@ -58,6 +62,7 @@ public class ConfigServiceImpl implements ConfigService {
     private final AgentContextProviderService agentContextProviderService;
     private final VoiceCloneService cloneVoiceService;
     private final AgentVoicePrintDao agentVoicePrintDao;
+    private final CorrectWordFileService correctWordFileService;
 
     @Override
     public Object getConfig(Boolean isCache) {
@@ -87,8 +92,13 @@ public class ConfigServiceImpl implements ConfigService {
                 null,
                 null,
                 null,
+                null,
+                null,
+                null,
+                null,
                 agent.getVadModelId(),
                 agent.getAsrModelId(),
+                null,
                 null,
                 null,
                 null,
@@ -109,7 +119,7 @@ public class ConfigServiceImpl implements ConfigService {
         // 检查是否为管理控制台请求
         String redisKey = RedisKeys.getTmpRegisterMacKey(macAddress);
         Object isAdminRequest = redisUtils.get(redisKey);
-        
+
         if (isAdminRequest != null && "true".equals(isAdminRequest)) {
             // 管理控制台请求，返回getConfig的结果
             redisUtils.delete(redisKey); // 使用后清理
@@ -135,15 +145,24 @@ public class ConfigServiceImpl implements ConfigService {
         String voice = null;
         String referenceAudio = null;
         String referenceText = null;
+        String language = null;
         TimbreDetailsVO timbre = timbreService.get(agent.getTtsVoiceId());
         if (timbre != null) {
             voice = timbre.getTtsVoice();
             referenceAudio = timbre.getReferenceAudio();
             referenceText = timbre.getReferenceText();
+            // 优先使用用户选择的语言，如果没有则使用音色支持的第一个语言
+            if (StringUtils.isNotBlank(agent.getTtsLanguage())) {
+                language = agent.getTtsLanguage();
+            } else if (StringUtils.isNotBlank(timbre.getLanguages())) {
+                language = timbre.getLanguages().split("、")[0].trim();
+            }
         } else {
             VoiceCloneEntity voice_print = cloneVoiceService.selectById(agent.getTtsVoiceId());
             if (voice_print != null) {
                 voice = voice_print.getVoiceId();
+                // 优先使用用户选择的语言，如果没有则使用默认值
+                language = StringUtils.isNotBlank(agent.getTtsLanguage()) ? agent.getTtsLanguage() : "普通话";
             }
         }
         // 构建返回数据
@@ -190,10 +209,11 @@ public class ConfigServiceImpl implements ConfigService {
             mcpEndpoint = mcpEndpoint.replace("/mcp/", "/call/");
             result.put("mcp_endpoint", mcpEndpoint);
         }
-        
+
         // 获取上下文源配置
         AgentContextProviderEntity contextProviderEntity = agentContextProviderService.getByAgentId(agent.getId());
-        if (contextProviderEntity != null && contextProviderEntity.getContextProviders() != null && !contextProviderEntity.getContextProviders().isEmpty()) {
+        if (contextProviderEntity != null && contextProviderEntity.getContextProviders() != null
+                && !contextProviderEntity.getContextProviders().isEmpty()) {
             result.put("context_providers", contextProviderEntity.getContextProviders());
         }
 
@@ -208,10 +228,15 @@ public class ConfigServiceImpl implements ConfigService {
                 voice,
                 referenceAudio,
                 referenceText,
+                language,
+                agent.getTtsVolume(),
+                agent.getTtsRate(),
+                agent.getTtsPitch(),
                 agent.getVadModelId(),
                 agent.getAsrModelId(),
                 agent.getLlmModelId(),
                 agent.getVllmModelId(),
+                agent.getSlmModelId(),
                 agent.getTtsModelId(),
                 agent.getMemModelId(),
                 agent.getIntentModelId(),
@@ -220,6 +245,18 @@ public class ConfigServiceImpl implements ConfigService {
                 true);
 
         return result;
+    }
+
+    @Override
+    public List<String> getCorrectWords(String macAddress) {
+        DeviceEntity device = deviceService.getDeviceByMacAddress(macAddress);
+        if (device == null) {
+            return Collections.emptyList();
+        }
+        List<CorrectWordSimpleVO> items = correctWordFileService.getAllItemsByAgentId(device.getAgentId());
+        return items.stream()
+                .map(item -> item.getSourceWord() + "|" + item.getTargetWord())
+                .collect(Collectors.toList());
     }
 
     /**
@@ -385,10 +422,15 @@ public class ConfigServiceImpl implements ConfigService {
             String voice,
             String referenceAudio,
             String referenceText,
+            String language,
+            Integer ttsVolume,
+            Integer ttsRate,
+            Integer ttsPitch,
             String vadModelId,
             String asrModelId,
             String llmModelId,
             String vllmModelId,
+            String slmModelId,
             String ttsModelId,
             String memModelId,
             String intentModelId,
@@ -397,9 +439,9 @@ public class ConfigServiceImpl implements ConfigService {
             boolean isCache) {
         Map<String, String> selectedModule = new HashMap<>();
 
-        String[] modelTypes = { "VAD", "ASR", "TTS", "Memory", "Intent", "LLM", "VLLM", "RAG" };
+        String[] modelTypes = { "VAD", "ASR", "TTS", "Memory", "Intent", "LLM", "VLLM", "SLM", "RAG" };
         String[] modelIds = { vadModelId, asrModelId, ttsModelId, memModelId, intentModelId, llmModelId, vllmModelId,
-                ragModelId };
+                slmModelId, ragModelId };
         String intentLLMModelId = null;
         String memLocalShortLLMModelId = null;
 
@@ -423,11 +465,19 @@ public class ConfigServiceImpl implements ConfigService {
                         ((Map<String, Object>) model.getConfigJson()).put("ref_audio", referenceAudio);
                     if (referenceText != null)
                         ((Map<String, Object>) model.getConfigJson()).put("ref_text", referenceText);
+                    if (language != null)
+                        ((Map<String, Object>) model.getConfigJson()).put("language", language);
+                    if (ttsVolume != null)
+                        ((Map<String, Object>) model.getConfigJson()).put("ttsVolume", ttsVolume);
+                    if (ttsRate != null)
+                        ((Map<String, Object>) model.getConfigJson()).put("ttsRate", ttsRate);
+                    if (ttsPitch != null)
+                        ((Map<String, Object>) model.getConfigJson()).put("ttsPitch", ttsPitch);
 
                     // 火山引擎声音克隆需要替换resource_id
                     Map<String, Object> map = (Map<String, Object>) model.getConfigJson();
                     if (Constant.VOICE_CLONE_HUOSHAN_DOUBLE_STREAM.equals(map.get("type"))) {
-                        // 如果voice是”S_“开头的，使用seed-icl-1.0
+                        // 如果voice是”S_”开头的，使用seed-icl-1.0
                         if (voice != null && voice.startsWith("S_")) {
                             map.put("resource_id", "seed-icl-1.0");
                         }
@@ -445,7 +495,7 @@ public class ConfigServiceImpl implements ConfigService {
                     if (map.get("functions") != null) {
                         String functionStr = (String) map.get("functions");
                         if (StringUtils.isNotBlank(functionStr)) {
-                            String[] functions = functionStr.split("\\;");
+                            String[] functions = functionStr.split(";");
                             map.put("functions", functions);
                         }
                     }
@@ -476,6 +526,15 @@ public class ConfigServiceImpl implements ConfigService {
                             ModelConfigEntity memLocalShortLLM = modelConfigService
                                     .getModelByIdFromCache(memLocalShortLLMModelId);
                             typeConfig.put(memLocalShortLLM.getId(), memLocalShortLLM.getConfigJson());
+                        }
+                    }
+                    // LLM也返回所选的SLM，如果同名id则不重复显示
+                    if (StringUtils.isNotBlank(slmModelId) && !slmModelId.equals(llmModelId)) {
+                        if (!typeConfig.containsKey(slmModelId)) {
+                            ModelConfigEntity slmModel = modelConfigService.getModelByIdFromCache(slmModelId);
+                            if (slmModel != null && slmModel.getConfigJson() != null) {
+                                typeConfig.put(slmModel.getId(), slmModel.getConfigJson());
+                            }
                         }
                     }
                 }
