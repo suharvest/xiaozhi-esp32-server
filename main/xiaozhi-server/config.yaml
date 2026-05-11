@@ -583,7 +583,19 @@ ASR:
     # 热词定制文档地址：https://help.aliyun.com/zh/model-studio/custom-hot-words?
     # vocabulary_id: vocab-xxx-24ee19fa8cfb4d52902170a0xxxxxxxx  # 热词ID(可选)
     # language_hints: ["zh", "en"]  # 指定语言(可选)，支持zh、en、ja、yue、ko、de、fr、ru
-    output_dir: tmp/  
+    output_dir: tmp/
+  JetsonVoice:
+    # jetson-voice 流式 ASR（本地/远程 Jetson 服务）
+    # 服务端口默认 8000，路径 /asr/stream，参数通过 query string 传递
+    type: jetson_voice
+    ws_url: ws://127.0.0.1:8000/asr/stream
+    sample_rate: 16000
+    language: auto
+    final_timeout: 5.0           # 等待最终识别结果的超时（秒）
+    partial_results: false       # 暂未启用：是否回显中间结果
+    fallback_to_partial: true    # 超时时用最近一次 partial 兜底
+    allow_backend_endpoint: false  # 是否允许后端自发的 final（默认只接受 end_utterance 触发的 final）
+    output_dir: tmp/
 VAD:
   SileroVAD:
     type: silero
