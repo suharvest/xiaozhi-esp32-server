@@ -15,7 +15,7 @@ logger = setup_logging()
 
 
 class TTSProvider(TTSProviderBase):
-    """jetson-voice TTS streaming provider.
+    """OpenVoiceStream TTS streaming provider.
 
     Differences vs Kokoro remote_tts_stream:
       * Response body has NO 44-byte WAV header. Instead the first 4 bytes
@@ -50,7 +50,7 @@ class TTSProvider(TTSProviderBase):
         self.pcm_buffer = bytearray()
 
         logger.bind(tag=TAG).info(
-            f"JetsonVoice TTS initialized, endpoint={self.api_url}, sid={self.sid}"
+            f"OpenVoiceStream TTS initialized, endpoint={self.api_url}, sid={self.sid}"
         )
 
     def _ensure_encoder(self, sample_rate: int):

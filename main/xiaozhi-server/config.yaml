@@ -584,11 +584,11 @@ ASR:
     # vocabulary_id: vocab-xxx-24ee19fa8cfb4d52902170a0xxxxxxxx  # 热词ID(可选)
     # language_hints: ["zh", "en"]  # 指定语言(可选)，支持zh、en、ja、yue、ko、de、fr、ru
     output_dir: tmp/
-  JetsonVoice:
-    # jetson-voice 流式 ASR（本地/远程 Jetson 服务）
-    # 服务端口默认 8000，路径 /asr/stream，参数通过 query string 传递
-    type: jetson_voice
-    ws_url: ws://127.0.0.1:8000/asr/stream
+  OpenVoiceStream:
+    # OpenVoiceStream 流式 ASR（本地/远程 Jetson/RK/RPi 服务）
+    # 服务端口默认 8621，路径 /asr/stream，参数通过 query string 传递
+    type: openvoicestream
+    ws_url: ws://127.0.0.1:8621/asr/stream
     sample_rate: 16000
     language: auto
     final_timeout: 5.0           # 等待最终识别结果的超时（秒）
@@ -1165,11 +1165,11 @@ TTS:
     # speed: 50  # 语速：0-100
     # pitch: 50  # 语调：0-100
     # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
-  JetsonVoice:
-    # jetson-voice 流式 TTS（本地/远程 Jetson 服务）
+  OpenVoiceStream:
+    # OpenVoiceStream 流式 TTS（本地/远程 Jetson/RK/RPi 服务）
     # POST {base_url}/tts/stream，响应体前 4 字节为 LE uint32 采样率，其余为 int16 PCM
-    type: jetson_voice_tts
-    base_url: http://127.0.0.1:8000
+    type: openvoicestream_tts
+    base_url: http://127.0.0.1:8621
     sid: 0
     speed: 1.0
     pitch: null        # 可选：null 时不传给后端

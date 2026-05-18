@@ -16,7 +16,7 @@ logger = setup_logging()
 
 
 class ASRProvider(ASRProviderBase):
-    """Streaming ASR provider for jetson-voice WebSocket service.
+    """Streaming ASR provider for OpenVoiceStream WebSocket service.
 
     Endpoint: ws://host:8000/asr/stream?sample_rate=...&language=...
       - Client sends int16 PCM binary frames, or JSON commands like
@@ -78,7 +78,7 @@ class ASRProvider(ASRProviderBase):
 
     async def _start_session(self, conn: "ConnectionHandler"):
         url = self._build_ws_url()
-        logger.bind(tag=TAG).debug(f"Connecting jetson-voice ASR ws: {url}")
+        logger.bind(tag=TAG).debug(f"Connecting OpenVoiceStream ASR ws: {url}")
         self.asr_ws = await websockets.connect(
             url,
             max_size=1000000000,
@@ -136,7 +136,7 @@ class ASRProvider(ASRProviderBase):
                 try:
                     raw = await self.asr_ws.recv()
                 except websockets.ConnectionClosed:
-                    logger.bind(tag=TAG).info("jetson-voice ASR ws closed")
+                    logger.bind(tag=TAG).info("OpenVoiceStream ASR ws closed")
                     break
                 except asyncio.CancelledError:
                     raise
@@ -181,7 +181,7 @@ class ASRProvider(ASRProviderBase):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.bind(tag=TAG).error(f"jetson-voice receive loop error: {e}")
+            logger.bind(tag=TAG).error(f"OpenVoiceStream receive loop error: {e}")
 
     # ------------------------------------------------------------------
     # Public ASR hooks
@@ -200,7 +200,7 @@ class ASRProvider(ASRProviderBase):
                 await self._start_session(conn)
             except Exception as e:
                 logger.bind(tag=TAG).error(
-                    f"Failed to open jetson-voice ASR session: {e}"
+                    f"Failed to open OpenVoiceStream ASR session: {e}"
                 )
                 await self._cleanup()
                 return
@@ -211,14 +211,14 @@ class ASRProvider(ASRProviderBase):
                 await self.asr_ws.send(pcm_frame)
             except Exception as e:
                 logger.bind(tag=TAG).warning(
-                    f"jetson-voice ASR send failed: {e}"
+                    f"OpenVoiceStream ASR send failed: {e}"
                 )
                 await self._cleanup()
 
     async def _send_stop_request(self):
         """Tell backend the utterance is over so it produces a final.
 
-        Empirically the jetson-voice server reliably emits {"type":"final"}
+        Empirically the OpenVoiceStream server reliably emits {"type":"final"}
         on the empty-bytes EOF marker (server then closes the socket), while
         the {"command":"end_utterance"} JSON command does not surface a final
         in the streaming backend path. Use the empty-bytes path.
@@ -228,7 +228,7 @@ class ASRProvider(ASRProviderBase):
         try:
             self._stop_sent = True
             await self.asr_ws.send(b"")
-            logger.bind(tag=TAG).debug("Sent EOF (b'') to jetson-voice")
+            logger.bind(tag=TAG).debug("Sent EOF (b'') to OpenVoiceStream")
         except Exception as e:
             logger.bind(tag=TAG).warning(f"EOF send failed: {e}")
 
@@ -243,14 +243,14 @@ class ASRProvider(ASRProviderBase):
                     )
                 except asyncio.TimeoutError:
                     logger.bind(tag=TAG).warning(
-                        f"jetson-voice final timeout after {self.final_timeout}s; "
+                        f"OpenVoiceStream final timeout after {self.final_timeout}s; "
                         f"fallback_to_partial={self.fallback_to_partial}, "
                         f"last_partial={self.last_partial!r}"
                     )
                     if self.fallback_to_partial and self.last_partial:
                         self.text = self.last_partial
         except Exception as e:
-            logger.bind(tag=TAG).error(f"jetson-voice handle_voice_stop error: {e}")
+            logger.bind(tag=TAG).error(f"OpenVoiceStream handle_voice_stop error: {e}")
         finally:
             # Always tear down the per-utterance session before delegating
             # to the base class, which will fan out the recognised text.
