@@ -46,7 +46,7 @@ class ASRProvider(ASRProviderBase):
             self.config.get("fallback_to_partial", True)
         )
         self.allow_backend_endpoint = bool(
-            self.config.get("allow_backend_endpoint", False)
+            self.config.get("allow_backend_endpoint", True)
         )
         self.output_dir = self.config.get("output_dir", "tmp/")
         self.delete_audio_file = delete_audio_file
@@ -60,7 +60,9 @@ class ASRProvider(ASRProviderBase):
         # Becomes True once we explicitly send end_utterance — only after that
         # do we honour a final from the backend (unless allow_backend_endpoint).
         self._stop_sent = False
+        self._handling_voice_stop = False  # mutex guarding handle_voice_stop entry
         self._pre_roll_done = False
+        self._conn = None
 
         self.decoder = opuslib_next.Decoder(16000, 1)
 
@@ -79,6 +81,7 @@ class ASRProvider(ASRProviderBase):
     async def _start_session(self, conn: "ConnectionHandler"):
         url = self._build_ws_url()
         logger.bind(tag=TAG).debug(f"Connecting OpenVoiceStream ASR ws: {url}")
+        self._conn = conn
         self.asr_ws = await websockets.connect(
             url,
             max_size=1000000000,
@@ -174,9 +177,34 @@ class ASRProvider(ASRProviderBase):
                         if text:
                             self.last_partial = text
                         continue
+                    # Either we triggered this via _send_stop_request, OR the
+                    # backend detected its own endpoint (only when
+                    # allow_backend_endpoint=True). First-wins mutex with
+                    # receive_audio's client_voice_stop path.
+                    if self._handling_voice_stop and not self._stop_sent:
+                        # Another path already scheduled handle_voice_stop;
+                        # just signal the final and exit.
+                        self.text = text or self.last_partial
+                        if self._final_event is not None:
+                            self._final_event.set()
+                        break
                     self.text = text or self.last_partial
                     if self._final_event is not None:
                         self._final_event.set()
+                    if not self._stop_sent and self.allow_backend_endpoint:
+                        # Backend self-endpointed; we must drive the rest of
+                        # the pipeline since framework won't auto-call
+                        # handle_voice_stop for STREAM providers.
+                        self._handling_voice_stop = True
+                        if self._conn is not None:
+                            snapshot = (
+                                list(self._conn.asr_audio)
+                                if hasattr(self._conn, "asr_audio")
+                                else []
+                            )
+                            asyncio.create_task(
+                                self.handle_voice_stop(self._conn, snapshot)
+                            )
                     break
         except asyncio.CancelledError:
             raise
@@ -214,6 +242,19 @@ class ASRProvider(ASRProviderBase):
                     f"OpenVoiceStream ASR send failed: {e}"
                 )
                 await self._cleanup()
+
+        # STREAM providers must self-trigger handle_voice_stop; framework's
+        # auto-call in base.py:76 only applies to non-STREAM. Mirror the
+        # pattern used by aliyun_stream.py:257, doubao_stream.py:203.
+        if (
+            conn.client_voice_stop
+            and not self._handling_voice_stop
+            and len(conn.asr_audio) >= 15
+        ):
+            self._handling_voice_stop = True
+            asr_audio_snapshot = list(conn.asr_audio)
+            await self.handle_voice_stop(conn, asr_audio_snapshot)
+            return
 
     async def _send_stop_request(self):
         """Tell backend the utterance is over so it produces a final.
@@ -261,6 +302,13 @@ class ASRProvider(ASRProviderBase):
         finally:
             # Reset for next utterance
             conn.reset_audio_states()
+            # Clear per-utterance state for the next round.
+            self.text = ""
+            self.last_partial = ""
+            self._handling_voice_stop = False
+            self._stop_sent = False
+            self._final_event = None
+            # asr_ws already closed by _cleanup(); do not reclose here.
 
     async def speech_to_text(
         self,
