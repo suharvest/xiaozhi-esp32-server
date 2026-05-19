@@ -432,4 +432,19 @@ export default {
                 });
             }).send();
     },
+    // 获取 OpenVoiceStream speakers 列表（manager-api 代理调用远端 /tts/capabilities）
+    getOvsSpeakers(baseUrl, callback) {
+        RequestService.sendRequest()
+            .url(`${getServiceUrl()}/ovs/tts/speakers?baseUrl=${encodeURIComponent(baseUrl)}`)
+            .method('GET')
+            .success((res) => {
+                RequestService.clearRequestTime();
+                callback(res);
+            })
+            .networkFail(() => {
+                RequestService.reAjaxFun(() => {
+                    this.getOvsSpeakers(baseUrl, callback);
+                });
+            }).send();
+    },
 }

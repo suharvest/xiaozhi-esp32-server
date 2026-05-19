@@ -429,6 +429,33 @@
                           </el-button>
                         </div>
                       </el-form-item>
+
+                      <!-- OVS Speaker 选择器（仅 OpenVoiceStream TTS 时显示） -->
+                      <el-form-item v-if="isOpenVoiceStreamTts" class="model-item">
+                        <template #label>
+                          <el-tooltip content="OpenVoiceStream Speaker — 从远端 /tts/capabilities 拉取" placement="top" effect="light" popper-class="custom-tooltip">
+                            <span>OVS Speaker</span>
+                          </el-tooltip>
+                        </template>
+                        <div class="model-select-wrapper">
+                          <el-select
+                            v-model="form.ttsSpeakerId"
+                            filterable
+                            clearable
+                            :disabled="!ovsTtsBaseUrl"
+                            :placeholder="ovsTtsBaseUrl ? $t('roleConfig.pleaseSelect') : '等待 Java 端扩展 DTO (base_url 不可用)'"
+                            class="form-select"
+                            @visible-change="visible => visible && fetchOvsSpeakers()"
+                          >
+                            <el-option
+                              v-for="item in ovsSpeakerOptions"
+                              :key="`ovs-${item.id}`"
+                              :label="item.label || `Speaker ${item.id}`"
+                              :value="item.id"
+                            />
+                          </el-select>
+                        </div>
+                      </el-form-item>
                     </div>
                   </div>
                 </div>
@@ -492,6 +519,7 @@ export default {
         agentCode: "",
         agentName: "",
         ttsVoiceId: "",
+        ttsSpeakerId: "",
         ttsVolume: null,
         ttsRate: null,
         ttsPitch: null,
@@ -528,6 +556,7 @@ export default {
       loadingTemplate: false,
       voiceOptions: [],
       voiceDetails: {}, // 保存完整的音色信息
+      ovsSpeakerOptions: [], // OpenVoiceStream speakers
       showFunctionDialog: false,
       currentFunctions: [],
       currentContextProviders: [],
@@ -551,7 +580,44 @@ export default {
       checkedReplacementWordIds: []
     };
   },
+  computed: {
+    // 判定当前选中的 TTS 模型是否为 OpenVoiceStream
+    isOpenVoiceStreamTts() {
+      const ttsModels = (this.modelOptions && this.modelOptions.TTS) || [];
+      const ttsModelId = this.form && this.form.model && this.form.model.ttsModelId;
+      const selected = ttsModels.find(m => (m.id || m.value) === ttsModelId);
+      if (!selected) return false;
+      // 主路径：依赖 Java 端扩展的 ModelBasicInfoDTO.type 字段
+      if (selected.type === 'openvoicestream_tts') return true;
+      // Fallback：DTO 还没扩展时，按 modelName / label grep 关键字兜底
+      const nameStr = `${selected.modelName || ''} ${selected.label || ''}`.toLowerCase();
+      return nameStr.includes('openvoicestream');
+    },
+    // 当前 OVS TTS 模型的 baseUrl（依赖 Java 端 DTO 扩展）
+    ovsTtsBaseUrl() {
+      const ttsModels = (this.modelOptions && this.modelOptions.TTS) || [];
+      const ttsModelId = this.form && this.form.model && this.form.model.ttsModelId;
+      const selected = ttsModels.find(m => (m.id || m.value) === ttsModelId);
+      return (selected && selected.baseUrl) || '';
+    },
+  },
   methods: {
+    // 拉取 OVS speakers 列表（通过 manager-api 代理调用远端 /tts/capabilities）
+    fetchOvsSpeakers() {
+      const baseUrl = this.ovsTtsBaseUrl;
+      if (!baseUrl) {
+        this.$message.warning('OVS base_url 未配置（等待 Java 端扩展 ModelBasicInfoDTO）');
+        return;
+      }
+      Api.agent.getOvsSpeakers(baseUrl, ({ data }) => {
+        if (data && data.code === 0 && Array.isArray(data.data)) {
+          this.ovsSpeakerOptions = data.data;
+        } else {
+          this.ovsSpeakerOptions = [];
+          this.$message.error((data && data.msg) || '获取 OVS speakers 失败');
+        }
+      });
+    },
     goToHome() {
       this.$router.push("/home");
     },
@@ -573,6 +639,7 @@ export default {
         vllmModelId: this.form.model.vllmModelId,
         ttsModelId: this.form.model.ttsModelId,
         ttsVoiceId: this.form.ttsVoiceId,
+        ttsSpeakerId: this.form.ttsSpeakerId,
         ttsLanguage: this.selectedLanguage,
         chatHistoryConf: this.form.chatHistoryConf,
         memModelId: this.form.model.memModelId,
@@ -628,6 +695,7 @@ export default {
             agentCode: "",
             agentName: "",
             ttsVoiceId: "",
+            ttsSpeakerId: "",
             chatHistoryConf: 0,
             systemPrompt: "",
             summaryMemory: "",
@@ -781,6 +849,11 @@ export default {
                   value: item.id,
                   label: item.modelName,
                   isHidden: false,
+                  // 透传 OVS 判定所需字段（Java 端 ModelBasicInfoDTO 扩展后生效）
+                  id: item.id,
+                  modelName: item.modelName,
+                  type: item.type,
+                  baseUrl: item.baseUrl,
                 }))
               );
 
