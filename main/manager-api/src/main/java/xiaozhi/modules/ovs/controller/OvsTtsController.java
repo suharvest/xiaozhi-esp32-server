@@ -4,8 +4,10 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 import org.apache.shiro.authz.annotation.RequiresPermissions;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -21,15 +23,41 @@ import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import xiaozhi.common.utils.Result;
+import xiaozhi.modules.model.entity.ModelConfigEntity;
+import xiaozhi.modules.model.service.ModelConfigService;
 
 @RestController
 @RequestMapping("/ovs/tts")
 @Tag(name = "OpenVoiceStream TTS")
 public class OvsTtsController {
 
+    @Autowired
+    private ModelConfigService modelConfigService;
+
     @GetMapping("/speakers")
     @RequiresPermissions("sys:role:normal")
-    public ResponseEntity<Result<List<Map<String, Object>>>> speakers(@RequestParam String baseUrl) {
+    public ResponseEntity<Result<List<Map<String, Object>>>> speakers(@RequestParam String modelId) {
+        // Look up base_url from the model's stored config — never trust a
+        // user-supplied URL (SSRF). modelId is whitelisted by table membership.
+        ModelConfigEntity model = modelConfigService.getModelByIdFromCache(modelId);
+        if (model == null || model.getConfigJson() == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(new Result<List<Map<String, Object>>>().error(404, "model not found"));
+        }
+        Object type = model.getConfigJson().get("type");
+        if (!"openvoicestream_tts".equals(type)) {
+            return ResponseEntity.badRequest()
+                    .body(new Result<List<Map<String, Object>>>().error(400,
+                            "model is not openvoicestream_tts"));
+        }
+        Object baseUrlObj = model.getConfigJson().get("base_url");
+        String baseUrl = baseUrlObj == null ? null : Objects.toString(baseUrlObj, null);
+        if (StrUtil.isBlank(baseUrl)) {
+            return ResponseEntity.badRequest()
+                    .body(new Result<List<Map<String, Object>>>().error(400,
+                            "model has no base_url"));
+        }
+
         try {
             String url = StrUtil.removeSuffix(baseUrl, "/") + "/tts/capabilities";
             HttpResponse response = null;

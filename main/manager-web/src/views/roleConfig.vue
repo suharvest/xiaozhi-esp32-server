@@ -442,8 +442,7 @@
                             v-model="form.ttsSpeakerId"
                             filterable
                             clearable
-                            :disabled="!ovsTtsBaseUrl"
-                            :placeholder="ovsTtsBaseUrl ? $t('roleConfig.pleaseSelect') : '等待 Java 端扩展 DTO (base_url 不可用)'"
+                            :placeholder="$t('roleConfig.pleaseSelect')"
                             class="form-select"
                             @visible-change="visible => visible && fetchOvsSpeakers()"
                           >
@@ -519,7 +518,7 @@ export default {
         agentCode: "",
         agentName: "",
         ttsVoiceId: "",
-        ttsSpeakerId: "",
+        ttsSpeakerId: null,
         ttsVolume: null,
         ttsRate: null,
         ttsPitch: null,
@@ -593,28 +592,21 @@ export default {
       const nameStr = `${selected.modelName || ''} ${selected.label || ''}`.toLowerCase();
       return nameStr.includes('openvoicestream');
     },
-    // 当前 OVS TTS 模型的 baseUrl（依赖 Java 端 DTO 扩展）
-    ovsTtsBaseUrl() {
-      const ttsModels = (this.modelOptions && this.modelOptions.TTS) || [];
-      const ttsModelId = this.form && this.form.model && this.form.model.ttsModelId;
-      const selected = ttsModels.find(m => (m.id || m.value) === ttsModelId);
-      return (selected && selected.baseUrl) || '';
-    },
   },
   methods: {
-    // 拉取 OVS speakers 列表（通过 manager-api 代理调用远端 /tts/capabilities）
+    // 拉取 OVS speakers 列表（通过 manager-api 用 modelId 查 base_url 后代理 /tts/capabilities）
     fetchOvsSpeakers() {
-      const baseUrl = this.ovsTtsBaseUrl;
-      if (!baseUrl) {
-        this.$message.warning('OVS base_url 未配置（等待 Java 端扩展 ModelBasicInfoDTO）');
+      const ttsModelId = this.form && this.form.model && this.form.model.ttsModelId;
+      if (!ttsModelId) {
+        this.$message.warning(this.$t('roleConfig.pleaseSelect'));
         return;
       }
-      Api.agent.getOvsSpeakers(baseUrl, ({ data }) => {
+      Api.agent.getOvsSpeakers(ttsModelId, ({ data }) => {
         if (data && data.code === 0 && Array.isArray(data.data)) {
           this.ovsSpeakerOptions = data.data;
         } else {
           this.ovsSpeakerOptions = [];
-          this.$message.error((data && data.msg) || '获取 OVS speakers 失败');
+          this.$message.error((data && data.msg) || 'OVS speakers fetch failed');
         }
       });
     },
@@ -695,7 +687,7 @@ export default {
             agentCode: "",
             agentName: "",
             ttsVoiceId: "",
-            ttsSpeakerId: "",
+            ttsSpeakerId: null,
             chatHistoryConf: 0,
             systemPrompt: "",
             summaryMemory: "",

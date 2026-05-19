@@ -310,9 +310,9 @@ public class AgentServiceImpl extends BaseServiceImpl<AgentDao, AgentEntity> imp
         if (dto.getTtsVoiceId() != null) {
             existingEntity.setTtsVoiceId(dto.getTtsVoiceId());
         }
-        if (dto.getTtsSpeakerId() != null) {
-            existingEntity.setTtsSpeakerId(dto.getTtsSpeakerId());
-        }
+        // Always write so a null from the client clears the saved value
+        // (otherwise the clearable UI dropdown is silently sticky).
+        existingEntity.setTtsSpeakerId(dto.getTtsSpeakerId());
         if (dto.getTtsLanguage() != null) {
             existingEntity.setTtsLanguage(dto.getTtsLanguage());
         }

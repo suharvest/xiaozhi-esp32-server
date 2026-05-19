@@ -432,10 +432,10 @@ export default {
                 });
             }).send();
     },
-    // 获取 OpenVoiceStream speakers 列表（manager-api 代理调用远端 /tts/capabilities）
-    getOvsSpeakers(baseUrl, callback) {
+    // 获取 OpenVoiceStream speakers 列表（manager-api 通过 modelId 查 base_url 后代理 /tts/capabilities）
+    getOvsSpeakers(modelId, callback) {
         RequestService.sendRequest()
-            .url(`${getServiceUrl()}/ovs/tts/speakers?baseUrl=${encodeURIComponent(baseUrl)}`)
+            .url(`${getServiceUrl()}/ovs/tts/speakers?modelId=${encodeURIComponent(modelId)}`)
             .method('GET')
             .success((res) => {
                 RequestService.clearRequestTime();
@@ -443,7 +443,7 @@ export default {
             })
             .networkFail(() => {
                 RequestService.reAjaxFun(() => {
-                    this.getOvsSpeakers(baseUrl, callback);
+                    this.getOvsSpeakers(modelId, callback);
                 });
             }).send();
     },
