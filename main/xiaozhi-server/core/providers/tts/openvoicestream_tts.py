@@ -1,9 +1,11 @@
 import os
 import struct
 import queue
+import threading
 import aiohttp
 import asyncio
 import traceback
+from typing import Optional
 from config.logger import setup_logging
 from core.utils.tts import MarkdownCleaner
 from core.providers.tts.base import TTSProviderBase
@@ -12,6 +14,29 @@ from core.providers.tts.dto.dto import SentenceType, ContentType, InterfaceType
 
 TAG = __name__
 logger = setup_logging()
+
+
+def _to_optional_int(v) -> Optional[int]:
+    """Coerce a config value to int, or return None for empty/invalid."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        # Bool is an int subclass; treat True/False as not-set to be safe
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 class TTSProvider(TTSProviderBase):
@@ -31,7 +56,19 @@ class TTSProvider(TTSProviderBase):
         self.interface_type = InterfaceType.SINGLE_STREAM
         self.base_url = config.get("base_url", "http://127.0.0.1:8000")
         self.api_url = f"{self.base_url}/tts/stream"
-        self.sid = config.get("sid", 0)
+        # Speaker selection — priority: embedding > speaker_id > sid (legacy).
+        # All default to None so we only send the field user actually set.
+        self.speaker_id = _to_optional_int(config.get("speaker_id"))
+        self.sid = _to_optional_int(config.get("sid"))  # legacy/deprecated
+        self.speaker_embedding_b64 = config.get("speaker_embedding_b64") or None
+
+        if self.speaker_embedding_b64 and self.speaker_id is not None:
+            logger.bind(tag=TAG).warning(
+                "Both speaker_embedding_b64 and speaker_id set; embedding wins"
+            )
+
+        self.available_speakers = {}  # id -> speaker dict, filled async by _fetch_capabilities
+
         self.speed = float(config.get("speed", 1.0))
         # Optional extras — only forwarded when not None
         pitch = config.get("pitch", None)
@@ -50,8 +87,19 @@ class TTSProvider(TTSProviderBase):
         self.pcm_buffer = bytearray()
 
         logger.bind(tag=TAG).info(
-            f"OpenVoiceStream TTS initialized, endpoint={self.api_url}, sid={self.sid}"
+            f"OpenVoiceStream TTS initialized, endpoint={self.api_url}, "
+            f"speaker_id={self.speaker_id}, sid={self.sid}, "
+            f"clone_voice={'yes' if self.speaker_embedding_b64 else 'no'}"
         )
+
+        # Fire-and-forget capabilities probe (non-blocking init).
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._fetch_capabilities())
+        except RuntimeError:
+            threading.Thread(
+                target=lambda: asyncio.run(self._fetch_capabilities()), daemon=True
+            ).start()
 
     def _ensure_encoder(self, sample_rate: int):
         """Create / replace Opus encoder when the response sample rate is known."""
@@ -146,9 +194,70 @@ class TTSProvider(TTSProviderBase):
         finally:
             return None
 
+    async def _post_with_503_retry(self, session, payload):
+        """POST to /tts/stream with 503 (hot-reload) retry; returns response or None on final failure."""
+        delay = 0.1
+        max_delay = 5.0
+        max_retries = 3
+        for attempt in range(max_retries + 1):
+            resp = await session.post(self.api_url, json=payload)
+            if resp.status != 503:
+                return resp
+            body = await resp.text()
+            await resp.release()
+            if attempt == max_retries:
+                logger.bind(tag=TAG).error(
+                    f"TTS still unavailable after {max_retries} retries: 503, body={body[:200]}"
+                )
+                return None
+            logger.bind(tag=TAG).warning(
+                f"TTS hot-reloading: 503, retry={attempt + 1}/{max_retries}, sleep={delay:.1f}s"
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, max_delay)
+        return None
+
+    async def _fetch_capabilities(self):
+        """Probe /tts/capabilities at startup; fill self.available_speakers + log model_id."""
+        url = f"{self.base_url}/tts/capabilities"
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    if resp.status == 503:
+                        logger.bind(tag=TAG).warning(
+                            "OVS TTS hot-reload in progress at startup; capabilities skipped"
+                        )
+                        return
+                    if resp.status != 200:
+                        logger.bind(tag=TAG).warning(
+                            f"TTS capabilities unavailable: status={resp.status}"
+                        )
+                        return
+                    data = await resp.json()
+            speakers = data.get("speakers") or []
+            self.available_speakers = {
+                int(s["id"]): s for s in speakers if isinstance(s, dict) and "id" in s
+            }
+            logger.bind(tag=TAG).info(
+                f"OVS TTS capabilities: model_id={data.get('model_id')!r} "
+                f"backend={data.get('backend')!r} speakers={sorted(self.available_speakers.keys())}"
+            )
+        except Exception as exc:
+            logger.bind(tag=TAG).warning(f"TTS capabilities probe failed: {exc}")
+
     async def text_to_speak(self, text, is_last=False):
         """Stream TTS audio. First 4 bytes of body are LE uint32 sample rate."""
-        payload = {"text": text, "sid": self.sid, "speed": self.speed}
+        payload = {"text": text}
+        if self.speed is not None:
+            payload["speed"] = self.speed
+        # Speaker priority: embedding > speaker_id > legacy sid
+        if self.speaker_embedding_b64 is not None:
+            payload["speaker_embedding_b64"] = self.speaker_embedding_b64
+        elif self.speaker_id is not None:
+            payload["speaker_id"] = self.speaker_id
+        elif self.sid is not None:
+            payload["sid"] = self.sid
         if self.pitch is not None:
             payload["pitch"] = self.pitch
         if self.language is not None:
@@ -157,7 +266,11 @@ class TTSProvider(TTSProviderBase):
         try:
             timeout = aiohttp.ClientTimeout(total=self.timeout)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(self.api_url, json=payload) as resp:
+                resp = await self._post_with_503_retry(session, payload)
+                if resp is None:
+                    self.tts_audio_queue.put((SentenceType.LAST, [], None))
+                    return
+                async with resp:
                     if resp.status != 200:
                         logger.bind(tag=TAG).error(
                             f"TTS request failed: {resp.status}, {await resp.text()}"

@@ -1,5 +1,6 @@
 import json
 import asyncio
+import aiohttp
 import websockets
 import opuslib_next
 from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
@@ -65,6 +66,49 @@ class ASRProvider(ASRProviderBase):
         self._conn = None
 
         self.decoder = opuslib_next.Decoder(16000, 1)
+
+        # Fire-and-forget capabilities probe (non-blocking init).
+        import threading
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._fetch_capabilities())
+        except RuntimeError:
+            threading.Thread(
+                target=lambda: asyncio.run(self._fetch_capabilities()), daemon=True
+            ).start()
+
+    async def _fetch_capabilities(self):
+        """Probe /asr/capabilities at startup (best-effort, non-blocking)."""
+        # Convert ws://host:port/asr/stream → http://host:port/asr/capabilities
+        try:
+            parsed = urlparse(self.ws_url_base if hasattr(self, "ws_url_base") else self.ws_url)
+            scheme = "https" if parsed.scheme == "wss" else "http"
+            url = f"{scheme}://{parsed.netloc}/asr/capabilities"
+        except Exception as exc:
+            logger.bind(tag=TAG).debug(f"ASR capabilities URL build failed: {exc}")
+            return
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    if resp.status == 503:
+                        logger.bind(tag=TAG).warning(
+                            "OVS ASR hot-reload in progress at startup; capabilities skipped"
+                        )
+                        return
+                    if resp.status != 200:
+                        logger.bind(tag=TAG).warning(
+                            f"ASR capabilities unavailable: status={resp.status}"
+                        )
+                        return
+                    data = await resp.json()
+            logger.bind(tag=TAG).info(
+                f"OVS ASR capabilities: backend={data.get('backend')!r} "
+                f"sample_rate={data.get('sample_rate')} "
+                f"capabilities={data.get('capabilities')}"
+            )
+        except Exception as exc:
+            logger.bind(tag=TAG).warning(f"ASR capabilities probe failed: {exc}")
 
     # ------------------------------------------------------------------
     # Connection setup / teardown

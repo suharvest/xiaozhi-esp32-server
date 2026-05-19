@@ -1170,9 +1170,11 @@ TTS:
     # POST {base_url}/tts/stream，响应体前 4 字节为 LE uint32 采样率，其余为 int16 PCM
     type: openvoicestream_tts
     base_url: http://127.0.0.1:8621
-    sid: 0
+    # speaker_id: null   # 推荐：int，新协议音色 ID（从 GET /tts/capabilities 获取列表）
+    # speaker_embedding_b64: null  # 可选：voice clone embedding base64；与 speaker_id 互斥，优先级最高
+    sid: 0               # ⚠️ 已废弃：legacy speaker id；新部署用 speaker_id
     speed: 1.0
-    pitch: null        # 可选：null 时不传给后端
-    language: null     # 可选：null 时不传给后端
+    pitch: null
+    language: null
     timeout: 30
     output_dir: tmp/
