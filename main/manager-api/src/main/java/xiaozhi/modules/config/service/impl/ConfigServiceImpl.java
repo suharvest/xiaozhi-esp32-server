@@ -96,6 +96,7 @@ public class ConfigServiceImpl implements ConfigService {
                 null,
                 null,
                 null,
+                null,
                 agent.getVadModelId(),
                 agent.getAsrModelId(),
                 null,
@@ -232,6 +233,7 @@ public class ConfigServiceImpl implements ConfigService {
                 agent.getTtsVolume(),
                 agent.getTtsRate(),
                 agent.getTtsPitch(),
+                agent.getTtsSpeakerId(),
                 agent.getVadModelId(),
                 agent.getAsrModelId(),
                 agent.getLlmModelId(),
@@ -426,6 +428,7 @@ public class ConfigServiceImpl implements ConfigService {
             Integer ttsVolume,
             Integer ttsRate,
             Integer ttsPitch,
+            Long ttsSpeakerId,
             String vadModelId,
             String asrModelId,
             String llmModelId,
@@ -456,55 +459,58 @@ public class ConfigServiceImpl implements ConfigService {
             }
             Map<String, Object> typeConfig = new HashMap<>();
             if (model.getConfigJson() != null) {
-                typeConfig.put(model.getId(), model.getConfigJson());
+                // deep clone (shallow copy of top-level map) to avoid polluting Mybatis Plus cache
+                Map<String, Object> modelConfig = new HashMap<>((Map<String, Object>) model.getConfigJson());
+                typeConfig.put(model.getId(), modelConfig);
                 // 如果是TTS类型，添加private_voice属性
                 if ("TTS".equals(modelTypes[i])) {
                     if (voice != null)
-                        ((Map<String, Object>) model.getConfigJson()).put("private_voice", voice);
+                        modelConfig.put("private_voice", voice);
                     if (referenceAudio != null)
-                        ((Map<String, Object>) model.getConfigJson()).put("ref_audio", referenceAudio);
+                        modelConfig.put("ref_audio", referenceAudio);
                     if (referenceText != null)
-                        ((Map<String, Object>) model.getConfigJson()).put("ref_text", referenceText);
+                        modelConfig.put("ref_text", referenceText);
                     if (language != null)
-                        ((Map<String, Object>) model.getConfigJson()).put("language", language);
+                        modelConfig.put("language", language);
                     if (ttsVolume != null)
-                        ((Map<String, Object>) model.getConfigJson()).put("ttsVolume", ttsVolume);
+                        modelConfig.put("ttsVolume", ttsVolume);
                     if (ttsRate != null)
-                        ((Map<String, Object>) model.getConfigJson()).put("ttsRate", ttsRate);
+                        modelConfig.put("ttsRate", ttsRate);
                     if (ttsPitch != null)
-                        ((Map<String, Object>) model.getConfigJson()).put("ttsPitch", ttsPitch);
+                        modelConfig.put("ttsPitch", ttsPitch);
 
                     // 火山引擎声音克隆需要替换resource_id
-                    Map<String, Object> map = (Map<String, Object>) model.getConfigJson();
-                    if (Constant.VOICE_CLONE_HUOSHAN_DOUBLE_STREAM.equals(map.get("type"))) {
+                    if (Constant.VOICE_CLONE_HUOSHAN_DOUBLE_STREAM.equals(modelConfig.get("type"))) {
                         // 如果voice是”S_”开头的，使用seed-icl-1.0
                         if (voice != null && voice.startsWith("S_")) {
-                            map.put("resource_id", "seed-icl-1.0");
+                            modelConfig.put("resource_id", "seed-icl-1.0");
                         }
+                    }
+                    // OpenVoiceStream speaker_id 注入
+                    if ("openvoicestream_tts".equals(modelConfig.get("type")) && ttsSpeakerId != null) {
+                        modelConfig.put("speaker_id", ttsSpeakerId);
                     }
                 }
                 // 如果是Intent类型，且type=intent_llm，则给他添加附加模型
                 if ("Intent".equals(modelTypes[i])) {
-                    Map<String, Object> map = (Map<String, Object>) model.getConfigJson();
-                    if ("intent_llm".equals(map.get("type"))) {
-                        intentLLMModelId = (String) map.get("llm");
+                    if ("intent_llm".equals(modelConfig.get("type"))) {
+                        intentLLMModelId = (String) modelConfig.get("llm");
                         if (StringUtils.isNotBlank(intentLLMModelId) && intentLLMModelId.equals(llmModelId)) {
                             intentLLMModelId = null;
                         }
                     }
-                    if (map.get("functions") != null) {
-                        String functionStr = (String) map.get("functions");
+                    if (modelConfig.get("functions") != null) {
+                        String functionStr = (String) modelConfig.get("functions");
                         if (StringUtils.isNotBlank(functionStr)) {
                             String[] functions = functionStr.split(";");
-                            map.put("functions", functions);
+                            modelConfig.put("functions", functions);
                         }
                     }
-                    System.out.println("map: " + map);
+                    System.out.println("map: " + modelConfig);
                 }
                 if ("Memory".equals(modelTypes[i])) {
-                    Map<String, Object> map = (Map<String, Object>) model.getConfigJson();
-                    if ("mem_local_short".equals(map.get("type"))) {
-                        memLocalShortLLMModelId = (String) map.get("llm");
+                    if ("mem_local_short".equals(modelConfig.get("type"))) {
+                        memLocalShortLLMModelId = (String) modelConfig.get("llm");
                         if (StringUtils.isNotBlank(memLocalShortLLMModelId)
                                 && memLocalShortLLMModelId.equals(llmModelId)) {
                             memLocalShortLLMModelId = null;

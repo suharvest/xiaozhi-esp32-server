@@ -310,6 +310,9 @@ public class AgentServiceImpl extends BaseServiceImpl<AgentDao, AgentEntity> imp
         if (dto.getTtsVoiceId() != null) {
             existingEntity.setTtsVoiceId(dto.getTtsVoiceId());
         }
+        if (dto.getTtsSpeakerId() != null) {
+            existingEntity.setTtsSpeakerId(dto.getTtsSpeakerId());
+        }
         if (dto.getTtsLanguage() != null) {
             existingEntity.setTtsLanguage(dto.getTtsLanguage());
         }

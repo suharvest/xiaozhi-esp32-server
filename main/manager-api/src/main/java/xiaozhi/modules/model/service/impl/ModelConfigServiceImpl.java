@@ -57,9 +57,24 @@ public class ModelConfigServiceImpl extends BaseServiceImpl<ModelConfigDao, Mode
                         .eq("model_type", modelType)
                         .eq("is_enabled", 1)
                         .like(StringUtils.isNotBlank(modelName), "model_name", modelName)
-                        .select("id", "model_name")
+                        .select("id", "model_name", "config_json")
                         .orderByAsc("sort"));
-        return ConvertUtils.sourceToTarget(entities, ModelBasicInfoDTO.class);
+        return entities.stream().map(item -> {
+            ModelBasicInfoDTO dto = new ModelBasicInfoDTO();
+            dto.setId(item.getId());
+            dto.setModelName(item.getModelName());
+            if (item.getConfigJson() != null) {
+                Object t = item.getConfigJson().get("type");
+                if (t != null) {
+                    dto.setType(t.toString());
+                }
+                Object base = item.getConfigJson().get("base_url");
+                if (base != null) {
+                    dto.setBaseUrl(base.toString());
+                }
+            }
+            return dto;
+        }).toList();
     }
 
     @Override

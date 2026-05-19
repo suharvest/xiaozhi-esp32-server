@@ -49,6 +49,10 @@ public class AgentEntity {
     @Schema(description = "音色标识")
     private String ttsVoiceId;
 
+    @com.baomidou.mybatisplus.annotation.TableField("tts_speaker_id")
+    @Schema(description = "OpenVoiceStream 预置说话人 ID")
+    private Long ttsSpeakerId;
+
     @Schema(description = "音色语言")
     private String ttsLanguage;
 
