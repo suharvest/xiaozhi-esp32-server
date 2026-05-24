@@ -904,9 +904,10 @@ class ConnectionHandler:
         # 更新系统prompt至上下文
         self.dialogue.update_system_message(self.prompt)
 
-    def chat(self, query, depth=0):
-        # 保存当前任务的sentence_id到局部变量，避免被新任务覆盖
-        current_sentence_id = None
+    def chat(self, query, depth=0, current_sentence_id=None):
+        # sentence_id 必须沿调用栈显式传递，禁止 depth>0 时从 self.sentence_id 读取——
+        # 若新一轮 chat() 已在另一线程把 self.sentence_id 覆盖成新值，旧轮的工具回流会
+        # 把音频投到新轮的队列里，导致跨轮 TTS 污染（详见 codex 审核 Q1）。
 
         if query is not None:
             self.logger.bind(tag=TAG).info(f"大模型收到用户消息: {query}")
@@ -914,7 +915,7 @@ class ConnectionHandler:
         # 为最顶层时新建会话ID和发送FIRST请求
         if depth == 0:
             current_sentence_id = str(uuid.uuid4().hex)
-            self.sentence_id = current_sentence_id  # 更新共享属性
+            self.sentence_id = current_sentence_id  # 更新共享属性（仅供 TTS 过滤器识别"当前活跃轮次"）
             self.dialogue.put(Message(role="user", content=query))
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
@@ -924,8 +925,9 @@ class ConnectionHandler:
                 )
             )
         else:
-            # 递归调用时，使用当前的sentence_id
-            current_sentence_id = self.sentence_id
+            # 递归调用必须由调用方显式传入；保底兜回 self.sentence_id，避免老调用方未升级时崩溃
+            if current_sentence_id is None:
+                current_sentence_id = self.sentence_id
 
         # 设置最大递归深度，避免无限循环，可根据实际需求调整
         MAX_DEPTH = 5
@@ -1217,7 +1219,12 @@ class ConnectionHandler:
 
                 # 统一处理工具调用结果
                 if tool_results:
-                    self._handle_function_result(tool_results, depth=depth, streamed_text=streamed_text)
+                    self._handle_function_result(
+                        tool_results,
+                        depth=depth,
+                        streamed_text=streamed_text,
+                        current_sentence_id=current_sentence_id,
+                    )
 
         # 存储对话内容
         if len(response_message) > 0:
@@ -1242,7 +1249,10 @@ class ConnectionHandler:
 
         return True
 
-    def _handle_function_result(self, tool_results, depth, streamed_text=""):
+    def _handle_function_result(self, tool_results, depth, streamed_text="", current_sentence_id=None):
+        # current_sentence_id 必须由 chat() 传入，避免在递归途中读取被新轮覆盖的 self.sentence_id
+        if current_sentence_id is None:
+            current_sentence_id = self.sentence_id
         need_llm_tools = []
         record_tools = []
 
@@ -1258,8 +1268,13 @@ class ConnectionHandler:
                         f"Skipping duplicate TTS for tool {tool_call_data['name']}, already streamed"
                     )
                 else:
-                    self.tts.tts_one_sentence(self, ContentType.TEXT, content_detail=text)
-                    self.tts.store_tts_text(self.sentence_id, text)
+                    self.tts.tts_one_sentence(
+                        self,
+                        ContentType.TEXT,
+                        content_detail=text,
+                        sentence_id=current_sentence_id,
+                    )
+                    self.tts.store_tts_text(current_sentence_id, text)
                 self.dialogue.put(Message(role="assistant", content=text))
             elif result.action == Action.REQLLM:
                 need_llm_tools.append((result, tool_call_data))
@@ -1348,7 +1363,7 @@ class ConnectionHandler:
                         )
                     )
 
-            self.chat(None, depth=depth + 1)
+            self.chat(None, depth=depth + 1, current_sentence_id=current_sentence_id)
 
     def _report_worker(self):
         """聊天记录上报工作线程"""
