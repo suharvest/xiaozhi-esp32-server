@@ -47,14 +47,22 @@ class ToolManager:
         return all_tools
 
     def get_function_descriptions(self) -> List[Dict[str, Any]]:
-        """获取所有工具的函数描述（OpenAI格式）"""
+        """获取所有工具的函数描述（OpenAI格式）。
+
+        Note: result is cached in ``_cached_function_descriptions``; any executor
+        that mutates its own tool set at runtime MUST call ``refresh_tools()`` to
+        invalidate this cache, otherwise the stale (pre-mutation) list is served
+        and the upstream prefix-cache key drifts from reality.
+        """
         if self._cached_function_descriptions is not None:
             return self._cached_function_descriptions
 
         descriptions = []
         tools = self.get_all_tools()
-        for tool_definition in tools.values():
-            descriptions.append(tool_definition.description)
+        # Sort by tool name so the rendered tools-prefix is byte-stable across
+        # sessions — required for the local LLM service's prefix KV-cache to hit.
+        for name in sorted(tools.keys()):
+            descriptions.append(tools[name].description)
 
         self._cached_function_descriptions = descriptions
         return descriptions
