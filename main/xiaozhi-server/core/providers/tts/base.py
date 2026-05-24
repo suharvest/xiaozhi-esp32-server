@@ -105,6 +105,12 @@ class TTSProviderBase(ABC):
         )
         # 首句最大字符数：超过即强制 TTS，不等标点（降低首音频延迟）
         self.first_sentence_max_chars = 5
+        # 后续句子的软上限：LLM 偶尔会输出超长无句尾标点的内容（列表、长描述、
+        # 中英混排等），rfind 拿不到 。！？ 时 TTS 会一直等。命中此上限后退化到
+        # 用逗号级标点切分，仍找不到则按上限硬切，避免无限期 stall。
+        self.subsequent_sentence_max_chars = int(
+            config.get("subsequent_sentence_max_chars", 80)
+        )
         self.tts_stop_request = False
         self.processed_chars = 0
         self.is_first_sentence = True
@@ -533,6 +539,24 @@ class TTSProviderBase(ABC):
             segment_text = textUtils.get_string_no_punctuation_or_emoji(current_text)
             self.processed_chars += len(current_text)
             self.is_first_sentence = False
+            return segment_text
+        # 后续句子超过软上限：先尝试逗号级标点切，找不到则硬切
+        elif (
+            not self.is_first_sentence
+            and len(current_text) >= self.subsequent_sentence_max_chars
+        ):
+            soft_puncts = ("，", ",", "、", "；", ";", "：", ":")
+            soft_pos = -1
+            for punct in soft_puncts:
+                pos = current_text.rfind(punct)
+                if pos > soft_pos:
+                    soft_pos = pos
+            if soft_pos != -1:
+                segment_text_raw = current_text[: soft_pos + 1]
+            else:
+                segment_text_raw = current_text
+            segment_text = textUtils.get_string_no_punctuation_or_emoji(segment_text_raw)
+            self.processed_chars += len(segment_text_raw)
             return segment_text
         elif self.tts_stop_request and current_text:
             segment_text = current_text
