@@ -40,6 +40,10 @@ class TTSProviderBase(ABC):
         self.tts_timeout = int(config.get("tts_timeout", 15))
         self.tts_text_queue = queue.Queue()
         self.tts_audio_queue = queue.Queue()
+        # 当前活跃轮次的 sentence_id；handle_opus 和子类的音频入队点都用它打 tag，
+        # 配合 _audio_play_priority_thread 的过滤器丢弃跨轮残音。
+        # 显式初始化为 None，避免依赖 getattr 兜底——首条音频之前的 chunk 也能被识别。
+        self.current_sentence_id = None
         self.tts_audio_first_sentence = True
         self.before_stop_play_files = []
         self.report_on_last = False
@@ -123,7 +127,7 @@ class TTSProviderBase(ABC):
 
     def handle_opus(self, opus_data: bytes):
         logger.bind(tag=TAG).debug(f"推送数据到队列里面帧数～～ {len(opus_data)}")
-        self.tts_audio_queue.put((SentenceType.MIDDLE, opus_data, None, getattr(self, 'current_sentence_id', None)))
+        self.tts_audio_queue.put((SentenceType.MIDDLE, opus_data, None, self.current_sentence_id))
 
     def handle_audio_file(self, file_audio: bytes, text):
         self.before_stop_play_files.append((file_audio, text))
@@ -143,7 +147,7 @@ class TTSProviderBase(ABC):
                     audio_bytes = asyncio.run(self.text_to_speak(text, None))
                     if audio_bytes:
                         # 使用原始文本用于显示/上报
-                        self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, getattr(self, 'current_sentence_id', None)))
+                        self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, self.current_sentence_id))
                         audio_bytes_to_data_stream(
                             audio_bytes,
                             file_type=self.audio_file_type,
@@ -192,7 +196,7 @@ class TTSProviderBase(ABC):
                     logger.bind(tag=TAG).error(
                         f"语音生成失败: {original_text}，请检查网络或服务是否正常"
                     )
-                self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, getattr(self, 'current_sentence_id', None)))
+                self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, self.current_sentence_id))
                 self._process_audio_file_stream(tmp_file, callback=opus_handler)
             except Exception as e:
                 logger.bind(tag=TAG).error(f"Failed to generate TTS file: {e}")
@@ -591,9 +595,9 @@ class TTSProviderBase(ABC):
 
     def _process_before_stop_play_files(self):
         for audio_datas, text in self.before_stop_play_files:
-            self.tts_audio_queue.put((SentenceType.MIDDLE, audio_datas, text, getattr(self, 'current_sentence_id', None)))
+            self.tts_audio_queue.put((SentenceType.MIDDLE, audio_datas, text, self.current_sentence_id))
         self.before_stop_play_files.clear()
-        self.tts_audio_queue.put((SentenceType.LAST, [], None, getattr(self, 'current_sentence_id', None)))
+        self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
 
     def _process_remaining_text_stream(
         self, opus_handler: Callable[[bytes], None] = None

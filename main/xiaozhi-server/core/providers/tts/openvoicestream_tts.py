@@ -280,18 +280,18 @@ class TTSProvider(TTSProviderBase):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 resp = await self._post_with_503_retry(session, payload)
                 if resp is None:
-                    self.tts_audio_queue.put((SentenceType.LAST, [], None, getattr(self, 'current_sentence_id', None)))
+                    self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
                     return
                 async with resp:
                     if resp.status != 200:
                         logger.bind(tag=TAG).error(
                             f"TTS request failed: {resp.status}, {await resp.text()}"
                         )
-                        self.tts_audio_queue.put((SentenceType.LAST, [], None, getattr(self, 'current_sentence_id', None)))
+                        self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
                         return
 
                     self.pcm_buffer.clear()
-                    self.tts_audio_queue.put((SentenceType.FIRST, [], text, getattr(self, 'current_sentence_id', None)))
+                    self.tts_audio_queue.put((SentenceType.FIRST, [], text, self.current_sentence_id))
 
                     # ---- Parse leading 4-byte LE sample rate header ----
                     header_buf = bytearray()
@@ -347,7 +347,7 @@ class TTSProvider(TTSProviderBase):
 
         except Exception as e:
             logger.bind(tag=TAG).error(f"TTS request exception: {e}")
-            self.tts_audio_queue.put((SentenceType.LAST, [], None, getattr(self, 'current_sentence_id', None)))
+            self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
 
     async def close(self):
         await super().close()
