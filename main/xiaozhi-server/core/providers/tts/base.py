@@ -434,6 +434,16 @@ class TTSProviderBase(ABC):
                     enqueue_text, enqueue_audio = None, []
                     continue
 
+                # 跨轮防泄：丢弃属于已结束轮次的残留音频。
+                # 仅当 client_abort=True 时上面已拦截；新轮开启后 abort 会被清回 False，
+                # 此时旧轮 rendered 但未推送的音频若不过滤，会在新轮开头闪一段旧声音。
+                if sentence_id and sentence_id != self.conn.sentence_id:
+                    logger.bind(tag=TAG).debug(
+                        f"丢弃过期轮次音频: msg.sentence_id={sentence_id}, current={self.conn.sentence_id}"
+                    )
+                    enqueue_text, enqueue_audio = None, []
+                    continue
+
                 # 收到下一个文本开始或会话结束时进行上报
                 if sentence_type is not SentenceType.MIDDLE:
                     if self.report_on_last:
