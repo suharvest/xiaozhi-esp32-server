@@ -124,6 +124,18 @@ class TTSProvider(TTSProviderBase):
         while not self.conn.stop_event.is_set():
             try:
                 message = self.tts_text_queue.get(timeout=1)
+                # 跨轮防泄：与 base.py 的默认实现保持一致——
+                # 1) client_abort 期间丢弃所有待合成文本
+                # 2) sentence_id 不属于当前活跃轮次的文本一并丢弃
+                # 否则旧轮的 LLM 文本会在新轮开始后继续被合成并推流。
+                if self.conn.client_abort:
+                    continue
+                if message.sentence_id and message.sentence_id != self.conn.sentence_id:
+                    continue
+                # 标记当前活跃轮次：handle_opus / text_to_speak 的音频入队都靠这个 tag，
+                # 这样 _audio_play_priority_thread 的 sentence_id 过滤才能识别 OVS 产出。
+                if message.sentence_id:
+                    self.current_sentence_id = message.sentence_id
                 if message.sentence_type == SentenceType.FIRST:
                     self.tts_stop_request = False
                     self.processed_chars = 0
@@ -268,18 +280,18 @@ class TTSProvider(TTSProviderBase):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 resp = await self._post_with_503_retry(session, payload)
                 if resp is None:
-                    self.tts_audio_queue.put((SentenceType.LAST, [], None))
+                    self.tts_audio_queue.put((SentenceType.LAST, [], None, getattr(self, 'current_sentence_id', None)))
                     return
                 async with resp:
                     if resp.status != 200:
                         logger.bind(tag=TAG).error(
                             f"TTS request failed: {resp.status}, {await resp.text()}"
                         )
-                        self.tts_audio_queue.put((SentenceType.LAST, [], None))
+                        self.tts_audio_queue.put((SentenceType.LAST, [], None, getattr(self, 'current_sentence_id', None)))
                         return
 
                     self.pcm_buffer.clear()
-                    self.tts_audio_queue.put((SentenceType.FIRST, [], text))
+                    self.tts_audio_queue.put((SentenceType.FIRST, [], text, getattr(self, 'current_sentence_id', None)))
 
                     # ---- Parse leading 4-byte LE sample rate header ----
                     header_buf = bytearray()
@@ -335,7 +347,7 @@ class TTSProvider(TTSProviderBase):
 
         except Exception as e:
             logger.bind(tag=TAG).error(f"TTS request exception: {e}")
-            self.tts_audio_queue.put((SentenceType.LAST, [], None))
+            self.tts_audio_queue.put((SentenceType.LAST, [], None, getattr(self, 'current_sentence_id', None)))
 
     async def close(self):
         await super().close()
