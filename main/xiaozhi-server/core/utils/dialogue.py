@@ -63,13 +63,26 @@ class Dialogue:
 
     def _ensure_tool_calls_complete(self, messages: List[Message]) -> List[Message]:
         """
-        确保所有 tool_calls 都有对应的 tool 响应
-        修复被打断导致的悬空 tool_calls，防止大模型 API 报 400 错误
+        对称兜底 tool_calls / tool 响应配对，防止 OpenAI 兼容 API 报 400：
+        - 悬空 assistant.tool_calls（无 tool 响应）→ 补一条 "interrupted" tool 响应
+        - 孤儿 tool 响应（找不到任何 assistant.tool_calls 持有该 id）→ 丢弃
+          常见于历史滑窗把上文 assistant 截掉、或历史本身已损坏
         """
+        # 第一遍：收集所有 assistant 暴露过的 tool_call id（无序，仅判存在性）
+        known_ids = set()
+        for msg in messages:
+            if msg.role == "assistant" and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                    if tc_id:
+                        known_ids.add(tc_id)
+
+        # 第二遍：构造结果，过滤孤儿 tool 响应，跟踪悬空 tool_calls
         pending_tool_calls = set()
         result = []
-
         for msg in messages:
+            if msg.role == "tool" and msg.tool_call_id and msg.tool_call_id not in known_ids:
+                continue  # 孤儿 tool 响应，跳过
             result.append(msg)
 
             if msg.role == "assistant" and msg.tool_calls:
@@ -91,8 +104,35 @@ class Dialogue:
 
         return result
 
+    def _apply_history_window(
+            self, messages: List["Message"], max_turns: int
+    ) -> List["Message"]:
+        """Keep only the last ``max_turns`` user turns plus everything that
+        follows each (assistant replies, tool_calls, tool responses).
+
+        Slicing at a user-message boundary guarantees we never strand a tool
+        response whose preceding assistant tool_calls got trimmed — which would
+        otherwise be rejected by OpenAI-compatible APIs.
+
+        Assumption: callers exclude few-shot/template messages (is_temporary=True)
+        before passing here. If a future code path passes user-role few-shots
+        through, they will inflate the turn count and silently shrink the real
+        history window. Defensive cleanup of any orphan tool responses still
+        happens downstream in _ensure_tool_calls_complete.
+        """
+        if max_turns is None or max_turns <= 0:
+            return messages
+        user_indices = [i for i, m in enumerate(messages) if m.role == "user"]
+        if len(user_indices) <= max_turns:
+            return messages
+        start = user_indices[-max_turns]
+        return messages[start:]
+
     def get_llm_dialogue_with_memory(
-            self, memory_str: str = None, voiceprint_config: dict = None
+            self,
+            memory_str: str = None,
+            voiceprint_config: dict = None,
+            max_history_turns: int = None,
     ) -> List[Dict[str, str]]:
         # 构建对话
         dialogue = []
@@ -164,8 +204,9 @@ class Dialogue:
 
             dialogue.append({"role": "system", "content": dynamic_part})
 
-        # 第四段：实际对话历史（不含 few-shot）
+        # 第四段：实际对话历史（不含 few-shot），先按用户轮数滑窗
         actual_messages = [m for m in non_system_messages if not m.is_temporary]
+        actual_messages = self._apply_history_window(actual_messages, max_history_turns)
         complete_actual = self._ensure_tool_calls_complete(actual_messages)
         for m in complete_actual:
             self.getMessages(m, dialogue)
