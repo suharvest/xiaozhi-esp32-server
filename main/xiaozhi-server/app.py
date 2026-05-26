@@ -47,13 +47,6 @@ async def main():
     check_ffmpeg_installed()
     config = load_config()
 
-    # 初始化插件描述（需要在load_config之后、服务启动之前）
-    try:
-        from plugins_func.functions.get_news_from_newsnow import init_news_description
-        init_news_description(config)
-    except Exception:
-        pass
-
     # auth_key优先级：配置文件server.auth_key > manager-api.secret > 自动生成
     # auth_key用于jwt认证，比如视觉分析接口的jwt认证、ota接口的token生成与websocket认证
     # 获取配置文件中的auth_key
@@ -123,7 +116,7 @@ async def main():
         "=======上面的地址是websocket协议地址，请勿用浏览器访问======="
     )
     logger.bind(tag=TAG).info(
-        "如想测试websocket请用谷歌浏览器打开test目录下的test_page.html"
+        "如想测试websocket请启动digital-human模块，打开浏览器交互测试"
     )
     logger.bind(tag=TAG).info(
         "=============================================================\n"
