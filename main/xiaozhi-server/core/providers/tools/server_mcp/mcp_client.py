@@ -43,6 +43,9 @@ class ServerMCPClient:
         self.tools: List = []  # 原始工具对象
         self.tools_dict: Dict[str, Any] = {}
         self.name_mapping: Dict[str, str] = {}
+        # 标记了 meta.requires_face 的工具（sanitized 名）。这类工具调用前需要
+        # 由 xiaozhi 先采集一帧人脸图并注入，见 ServerMCPManager._inject_device_face。
+        self.tools_requiring_face: set[str] = set()
 
     async def initialize(self, read_timeout_seconds: timedelta | None = None,
              sampling_callback: SamplingFnT | None = None,
@@ -93,6 +96,10 @@ class ServerMCPClient:
             bool: 是否包含该工具
         """
         return name in self.tools_dict
+
+    def requires_face(self, name: str) -> bool:
+        """该工具是否声明了 meta.requires_face（需要先采集人脸再调用）"""
+        return name in self.tools_requiring_face
 
     def get_available_tools(self) -> List[Dict[str, Any]]:
         """获取所有可用工具的定义
@@ -249,6 +256,16 @@ class ServerMCPClient:
                     sanitized = sanitize_tool_name(t.name)
                     self.tools_dict[sanitized] = t
                     self.name_mapping[sanitized] = t.name
+                    # 被动发现需要人脸校验的工具：由 MCP 服务端（如 warehouse）在工具
+                    # 元数据里声明 _meta.requires_face=True，xiaozhi 不写死工具名。
+                    meta = getattr(t, "meta", None)
+                    if isinstance(meta, dict) and meta.get("requires_face"):
+                        self.tools_requiring_face.add(sanitized)
+
+                if self.tools_requiring_face:
+                    self.logger.bind(tag=TAG).info(
+                        f"需要人脸校验的MCP工具: {self.tools_requiring_face}"
+                    )
 
                 self._ready_evt.set()
 

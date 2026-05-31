@@ -131,6 +131,12 @@ class ServerMCPManager:
         if not target_client:
             raise ValueError(f"工具 {tool_name} 在任意MCP服务中未找到")
 
+        # 人脸校验注入：若该工具声明了 meta.requires_face，先用设备摄像头采集一帧，
+        # 注入 face_image_b64 再发往服务端。任一步失败都直接抛错（绝不把空图透传，
+        # 否则服务端会按 no_image 拒绝、语义混乱）。
+        if target_client.requires_face(tool_name):
+            await self._inject_device_face(tool_name, arguments)
+
         # 带重试机制的工具调用
         for attempt in range(max_retries):
             try:
@@ -173,6 +179,49 @@ class ServerMCPManager:
 
                 # 等待一段时间再重试
                 await asyncio.sleep(retry_interval)
+
+    # 设备端人脸采集工具名（在固件 sscma_camera.cc::InitializeMcpTools 注册）。
+    # sanitize 后 '.' → '_'，与设备 MCP 客户端缓存的键一致。
+    _FACE_CAPTURE_TOOL = "self.camera.capture_raw"
+
+    async def _inject_device_face(self, tool_name: str, arguments: Dict[str, Any]) -> None:
+        """采集一帧人脸图并注入到 arguments['face_image_b64']。
+
+        拓扑 A（云端推理）：设备只负责拍照，warehouse 侧再调 face_rec_api 算
+        embedding。失败一律抛 RuntimeError —— 上层把它作为工具错误返回给 LLM，
+        由 LLM 口播"人脸校验失败"，绝不静默放行。
+        """
+        from core.utils.util import sanitize_tool_name
+        from core.providers.tools.device_mcp.mcp_handler import call_mcp_tool
+
+        conn = self.conn
+        mcp_client = getattr(conn, "mcp_client", None)
+        if not mcp_client:
+            raise RuntimeError("人脸校验需要设备摄像头，但当前设备未启用 MCP")
+        if not await mcp_client.is_ready():
+            raise RuntimeError("设备摄像头未就绪，无法完成人脸校验")
+
+        capture_tool = sanitize_tool_name(self._FACE_CAPTURE_TOOL)
+        if not mcp_client.has_tool(capture_tool):
+            raise RuntimeError("当前设备不支持人脸采集（缺少 capture_raw 工具）")
+
+        logger.bind(tag=TAG).info(f"工具 {tool_name} 需要人脸，先采集摄像头帧")
+        # 拍照走设备同步流程（~700ms），给 10s 余量但远小于默认 30s，避免长时间挂起。
+        raw = await call_mcp_tool(conn, mcp_client, capture_tool, "{}", timeout=10)
+
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            image_b64 = data.get("image_b64") if isinstance(data, dict) else None
+        except (json.JSONDecodeError, AttributeError) as e:
+            raise RuntimeError(f"设备人脸采集返回格式异常: {e}")
+
+        if not image_b64:
+            raise RuntimeError("设备返回的人脸图为空")
+
+        arguments["face_image_b64"] = image_b64
+        logger.bind(tag=TAG).info(
+            f"已注入 face_image_b64（{len(image_b64)} chars）到工具 {tool_name}"
+        )
 
     async def cleanup_all(self) -> None:
         """关闭所有 MCP客户端"""
