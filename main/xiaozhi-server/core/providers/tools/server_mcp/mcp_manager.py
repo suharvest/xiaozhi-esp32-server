@@ -180,16 +180,21 @@ class ServerMCPManager:
                 # 等待一段时间再重试
                 await asyncio.sleep(retry_interval)
 
-    # 设备端人脸采集工具名（在固件 sscma_camera.cc::InitializeMcpTools 注册）。
-    # sanitize 后 '.' → '_'，与设备 MCP 客户端缓存的键一致。
-    _FACE_CAPTURE_TOOL = "self.camera.capture_raw"
+    # 设备端人脸工具名（在固件 sscma_camera.cc 注册）。sanitize 后 '.' → '_'，
+    # 与设备 MCP 客户端缓存的键一致。
+    _FACE_EMBEDDING_TOOL = "self.face.capture_embedding"  # 拓扑 B：设备 NPU 算 embedding
+    _FACE_CAPTURE_TOOL = "self.camera.capture_raw"        # 拓扑 A：设备只拍图
 
     async def _inject_device_face(self, tool_name: str, arguments: Dict[str, Any]) -> None:
-        """采集一帧人脸图并注入到 arguments['face_image_b64']。
+        """采集人脸凭证并注入到工具参数。自动选择拓扑：
 
-        拓扑 A（云端推理）：设备只负责拍照，warehouse 侧再调 face_rec_api 算
-        embedding。失败一律抛 RuntimeError —— 上层把它作为工具错误返回给 LLM，
-        由 LLM 口播"人脸校验失败"，绝不静默放行。
+        - 拓扑 B（端侧推理，优先）：设备暴露 capture_embedding → 注入
+          face_embedding_b64 + face_model_tag，warehouse 本地比对（不调外部 /infer）。
+        - 拓扑 A（云端推理，回退）：设备只暴露 capture_raw → 注入 face_image_b64，
+          warehouse 侧调 face_rec_api 算 embedding。
+
+        失败一律抛 RuntimeError —— 上层作为工具错误返回给 LLM，由 LLM 口播
+        "人脸校验失败"，绝不静默放行。
         """
         from core.utils.util import sanitize_tool_name
         from core.providers.tools.device_mcp.mcp_handler import call_mcp_tool
@@ -201,23 +206,54 @@ class ServerMCPManager:
         if not await mcp_client.is_ready():
             raise RuntimeError("设备摄像头未就绪，无法完成人脸校验")
 
+        embed_tool = sanitize_tool_name(self._FACE_EMBEDDING_TOOL)
         capture_tool = sanitize_tool_name(self._FACE_CAPTURE_TOOL)
-        if not mcp_client.has_tool(capture_tool):
-            raise RuntimeError("当前设备不支持人脸采集（缺少 capture_raw 工具）")
 
-        logger.bind(tag=TAG).info(f"工具 {tool_name} 需要人脸，先采集摄像头帧")
-        # 拍照走设备同步流程（~700ms），给 10s 余量但远小于默认 30s，避免长时间挂起。
-        raw = await call_mcp_tool(conn, mcp_client, capture_tool, "{}", timeout=10)
+        if mcp_client.has_tool(embed_tool):
+            await self._inject_embedding(tool_name, arguments, mcp_client, embed_tool)
+        elif mcp_client.has_tool(capture_tool):
+            await self._inject_image(tool_name, arguments, mcp_client, capture_tool)
+        else:
+            raise RuntimeError("当前设备不支持人脸采集（缺少 capture_embedding / capture_raw 工具）")
 
+    async def _inject_embedding(self, tool_name, arguments, mcp_client, embed_tool) -> None:
+        """拓扑 B：设备端算好 embedding，直接注入。"""
+        from core.providers.tools.device_mcp.mcp_handler import call_mcp_tool
+
+        logger.bind(tag=TAG).info(f"工具 {tool_name} 需要人脸，端侧采集 embedding")
+        # 设备单次推理 ~820ms（含切模式冷启），给 10s 余量。
+        raw = await call_mcp_tool(self.conn, mcp_client, embed_tool, "{}", timeout=10)
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"设备 embedding 返回格式异常: {e}")
+        if not isinstance(data, dict) or not data.get("ok"):
+            err = data.get("error") if isinstance(data, dict) else "unknown"
+            raise RuntimeError(f"设备人脸采集失败: {err}")
+        emb = data.get("embedding_b64")
+        if not emb:
+            raise RuntimeError("设备返回的 embedding 为空")
+        arguments["face_embedding_b64"] = emb
+        # model_tag 让设备/warehouse 配置约定；设备未带时由 warehouse 用租户配置兜底。
+        if data.get("model_tag"):
+            arguments["face_model_tag"] = data["model_tag"]
+        logger.bind(tag=TAG).info(
+            f"已注入 face_embedding_b64（{len(emb)} chars）到工具 {tool_name}"
+        )
+
+    async def _inject_image(self, tool_name, arguments, mcp_client, capture_tool) -> None:
+        """拓扑 A：设备只拍图，warehouse 侧算 embedding。"""
+        from core.providers.tools.device_mcp.mcp_handler import call_mcp_tool
+
+        logger.bind(tag=TAG).info(f"工具 {tool_name} 需要人脸，端侧拍照（云端推理）")
+        raw = await call_mcp_tool(self.conn, mcp_client, capture_tool, "{}", timeout=10)
         try:
             data = json.loads(raw) if isinstance(raw, str) else raw
             image_b64 = data.get("image_b64") if isinstance(data, dict) else None
         except (json.JSONDecodeError, AttributeError) as e:
             raise RuntimeError(f"设备人脸采集返回格式异常: {e}")
-
         if not image_b64:
             raise RuntimeError("设备返回的人脸图为空")
-
         arguments["face_image_b64"] = image_b64
         logger.bind(tag=TAG).info(
             f"已注入 face_image_b64（{len(image_b64)} chars）到工具 {tool_name}"
