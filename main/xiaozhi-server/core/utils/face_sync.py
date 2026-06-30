@@ -3,7 +3,7 @@
 Single source of truth = warehouse. The device is a follower: on connect or
 on voice trigger, xiaozhi pulls the warehouse face config (greeting_enabled)
 and library (name + embedding), then aligns the device-local state via device
-MCP tools (self.face.add, self.face.enable). Embeddings flow entirely inside
+MCP tools (self.face.add, self.vision.mode). Embeddings flow entirely inside
 this module (HTTP in, device MCP out) — never through the LLM.
 
 Robustness (must hold): warehouse being unreachable must NEVER degrade the
@@ -30,7 +30,10 @@ TAG = __name__
 logger = setup_logging()
 
 _FACE_ADD = sanitize_tool_name("self.face.add")
-_FACE_ENABLE = sanitize_tool_name("self.face.enable")
+# Device unified its proactive-wake switches into self.vision.mode(0-3):
+# 0=off, 1=object, 2=face recognition, 3=face DND. The warehouse only carries a
+# boolean greeting switch, so we map greeting on -> mode 2, off -> mode 0.
+_VISION_MODE = sanitize_tool_name("self.vision.mode")
 
 
 def _endpoints(conn: "ConnectionHandler"):
@@ -115,11 +118,12 @@ async def sync_face_state(conn: "ConnectionHandler") -> dict:
 
     # 4) align greeting switch (only if we successfully read it)
     aligned = None
-    if greeting_enabled is not None and mcp_client.has_tool(_FACE_ENABLE):
+    if greeting_enabled is not None and mcp_client.has_tool(_VISION_MODE):
         from core.providers.tools.device_mcp.mcp_handler import call_mcp_tool
         try:
-            args = json.dumps({"enable": 1 if greeting_enabled else 0})
-            await call_mcp_tool(conn, mcp_client, _FACE_ENABLE, args, timeout=10)
+            # greeting on -> face recognition (mode 2); off -> no proactive wake (mode 0)
+            args = json.dumps({"mode": 2 if greeting_enabled else 0})
+            await call_mcp_tool(conn, mcp_client, _VISION_MODE, args, timeout=10)
             aligned = greeting_enabled
         except Exception as e:
             logger.bind(tag=TAG).error(f"对齐打招呼开关异常: {e}")
