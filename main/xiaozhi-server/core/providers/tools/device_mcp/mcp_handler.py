@@ -217,17 +217,18 @@ async def handle_mcp_message(
                         conn.func_handler.tool_manager.refresh_tools()
                         conn.func_handler.current_support_functions()
 
-                    # 设备连上即对齐：拉 warehouse 人脸库+打招呼开关下发设备。
+                    # 设备连上即对齐：拉 warehouse 的打招呼开关下发设备。
                     # best-effort，warehouse 不可达时保持设备现状（见 face_sync）。
+                    # 人脸库下发不走这里 —— warehouse 用 push-faces 直推设备。
                     if conn.config.get("face_sync") and mcp_client.has_tool(
-                        sanitize_tool_name("self.face.add")
+                        sanitize_tool_name("self.vision.mode")
                     ):
                         try:
                             from core.utils.face_sync import sync_face_state
 
                             conn.loop.create_task(sync_face_state(conn))
                         except Exception as e:
-                            logger.bind(tag=TAG).warning(f"人脸库自动同步触发失败(忽略): {e}")
+                            logger.bind(tag=TAG).warning(f"打招呼开关自动同步触发失败(忽略): {e}")
             return
 
     # Handle method calls (requests from the client)

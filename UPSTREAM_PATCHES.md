@@ -27,8 +27,8 @@ These are wholly ours; upstream doesn't touch them.
 | `core/providers/tts/openvoicestream_tts.py` | OVS streaming TTS provider |
 | `core/providers/tts/remote_tts.py`, `remote_tts_stream.py` | remote TTS base/stream |
 | `core/providers/tts/sherpa_onnx_tts.py` | sherpa-onnx local TTS |
-| `core/utils/face_sync.py` | face library + greeting-switch sync (warehouse→device), fail-safe |
-| `plugins_func/functions/sync_face_library.py` | voice-trigger plugin for the above |
+| `core/utils/face_sync.py` | greeting-switch sync (warehouse→device), fail-safe. Face *library* push was removed 2026-08 — warehouse pushes faces directly via `POST /api/mcp/connections/{c}/devices/{d}/push-faces` |
+| `plugins_func/functions/sync_face_library.py` | voice-trigger plugin for the above (name kept for back-compat; it now syncs the greeting switch only) |
 
 **Merge action:** none. Just confirm they still exist.
 
@@ -45,13 +45,25 @@ Grouped by theme. Each row: what we changed + why + how to verify after merge.
 | `config.yaml` | Added `OpenVoiceStream` ASR/TTS provider blocks, `EdgeLLM` LLM block; default `selected_module` may reference them | `grep -E "OpenVoiceStream\|EdgeLLM" config.yaml` present; provider blocks intact |
 | `core/providers/asr/sherpa_onnx_local.py` | Moved `modelscope` import inside the function (lazy) for macOS compat | import is inside the method, not module top |
 
+> **SUPERSEDED — VAD ONNX patch (commit `0ad7cf4a`).** We used to carry a
+> `core/providers/vad/silero_onnx_wrapper.py` shim so Silero VAD ran on
+> onnxruntime instead of torch. Upstream has since rewritten
+> `core/providers/vad/silero.py` to use onnxruntime itself, our wrapper file no
+> longer exists, and `core/providers/vad/` is **zero-diff vs `origin/main`**.
+> No merge action needed — dropped from the maintenance list.
+
 > Note: live ASR/TTS/LLM endpoints (orin-nx IPs) live in **`data/.config.yaml`**
 > (gitignored), not `config.yaml`. See "Console mode" below for how these
 > survive the manager/智控台 switch.
 
-### B2. Removed upstream call_device / address-book / device-call feature
+### B2. ~~Removed upstream call_device / address-book / device-call feature~~ — **ENTRY IS WRONG, DO NOT ACT ON IT**
 
-We don't use the device-to-device calling feature; removed it and its hooks.
+> **This section was recorded in error.** The `call_device` / address-book /
+> device-call feature does **not** exist in our merge-base — upstream added it
+> in 2026, *after* the fork point. We never deleted it, so there is nothing
+> here to re-apply or re-remove on merge. The table below is kept only so the
+> next person doesn't "restore" a patch that never existed. If we later decide
+> we don't want upstream's call_device, that becomes a new, deliberate removal.
 
 | File | Change | Verify after merge |
 |---|---|---|
@@ -60,9 +72,6 @@ We don't use the device-to-device calling feature; removed it and its hooks.
 | `config/manage_api_client.py` | Removed `lookup_address_book()` func | same |
 | `core/handle/sendAudioHandle.py` | Dropped `conn.calling` speaking-state branch | `if sentenceType == SentenceType.LAST:` (no `conn.calling`) |
 | `core/handle/textHandler/listenMessageHandler.py` | Dropped `[device_call]` command handling + its imports | no `[device_call]` branch |
-
-> If upstream evolves call_device, decide per-merge whether to keep removing it
-> or adopt their version. Currently: keep removed.
 
 ### B3. Conversation quality / performance (session 2026-05)
 
@@ -73,13 +82,30 @@ We don't use the device-to-device calling feature; removed it and its hooks.
 | `core/providers/tts/base.py` | (1) `current_sentence_id` init + stale-turn audio drop in `_audio_play_priority_thread`; (2) `subsequent_sentence_max_chars` soft-cap split | `self.current_sentence_id` in `__init__`; soft-cap branch in `_get_segment_text` |
 | `core/providers/tools/unified_tool_manager.py` | `get_function_descriptions()` sorts tool names (stable prefix for edge-llm KV-cache) + refresh_tools cache note | `for name in sorted(tools.keys())` |
 
-### B4. Face pipeline (session 2026-05/06) — out-of-stock auth + greeting sync
+### B4. Face pipeline — greeting sync only (as of 2026-08)
 
 | File | Change | Verify after merge |
 |---|---|---|
-| `core/providers/tools/server_mcp/mcp_client.py` | Discover `_meta.requires_face` tools at list_tools; cache `tools_requiring_face`; `requires_face()` query | `self.tools_requiring_face` set populated from `meta` |
-| `core/providers/tools/server_mcp/mcp_manager.py` | `_inject_device_face` dual-topology (B: device embedding via `self.face.capture_embedding`; A: image via `self.camera.capture_raw`) before forwarding requires_face tools; fail-closed | `_inject_device_face` + `_inject_embedding` + `_inject_image` methods |
 | `core/providers/tools/device_mcp/mcp_handler.py` | After device-MCP set_ready, fire one `sync_face_state` auto-sync if `face_sync` configured + `self.face.add` exists; best-effort | hook calling `from core.utils.face_sync import sync_face_state` after `set_ready(True)` |
+
+> **REMOVED 2026-08 — runtime face/speaker injection.** We used to patch
+> `server_mcp/mcp_client.py` (discover `_meta.requires_face` / `requires_speaker`
+> tools, cache `tools_requiring_face` / `tools_requiring_speaker`) and
+> `server_mcp/mcp_manager.py` (`_inject_device_face` / `_inject_embedding` /
+> `_inject_image` / `_inject_session_speaker` before forwarding such tools).
+> Warehouse moved to an "option 3" architecture on 2026-07-18: the backend is
+> the sole authority and pulls face identity from the device itself, so it no
+> longer emits `requires_face`, and never emitted `requires_speaker`. With no
+> trigger source left, this was dead code and has been deleted — both files are
+> back to upstream shape for these hunks. **Do not re-apply.**
+
+> **REMOVED 2026-08 — face-library push from `core/utils/face_sync.py`.**
+> Warehouse pushes the library directly via
+> `POST /api/mcp/connections/{c}/devices/{d}/push-faces` (with model_tag
+> filtering, subject_id passthrough, 20-face cap — none of which our pusher
+> had). `face_sync.py` now only syncs the greeting switch
+> (`/api/face/config` → device `self.vision.mode`), which warehouse has no
+> push channel for.
 
 ### B5. Misc
 
