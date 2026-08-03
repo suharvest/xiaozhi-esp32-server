@@ -10,6 +10,7 @@ export default {
   'header.smartManagement': 'Agents',
   'header.modelConfig': 'Models',
   'header.knowledgeBase': 'Knowledge',
+  'header.faceLibrary': 'Face Library',
   'header.voiceCloneManagement': 'Voice Clone',
   'header.voiceResourceManagement': 'Voice Resource',
   'header.userManagement': 'Users',
