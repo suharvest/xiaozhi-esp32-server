@@ -46,6 +46,9 @@ class ServerMCPClient:
         # 标记了 meta.requires_face 的工具（sanitized 名）。这类工具调用前需要
         # 由 xiaozhi 先采集一帧人脸图并注入，见 ServerMCPManager._inject_device_face。
         self.tools_requiring_face: set[str] = set()
+        # 标记了 meta.requires_speaker 的工具（sanitized 名）。这类工具调用前需要
+        # 由 xiaozhi 注入当前会话的声纹识别结果，见 ServerMCPManager._inject_session_speaker。
+        self.tools_requiring_speaker: set[str] = set()
 
     async def initialize(self, read_timeout_seconds: timedelta | None = None,
              sampling_callback: SamplingFnT | None = None,
@@ -100,6 +103,10 @@ class ServerMCPClient:
     def requires_face(self, name: str) -> bool:
         """该工具是否声明了 meta.requires_face（需要先采集人脸再调用）"""
         return name in self.tools_requiring_face
+
+    def requires_speaker(self, name: str) -> bool:
+        """该工具是否声明了 meta.requires_speaker（需要注入会话说话人）"""
+        return name in self.tools_requiring_speaker
 
     def get_available_tools(self) -> List[Dict[str, Any]]:
         """获取所有可用工具的定义
@@ -261,10 +268,16 @@ class ServerMCPClient:
                     meta = getattr(t, "meta", None)
                     if isinstance(meta, dict) and meta.get("requires_face"):
                         self.tools_requiring_face.add(sanitized)
+                    if isinstance(meta, dict) and meta.get("requires_speaker"):
+                        self.tools_requiring_speaker.add(sanitized)
 
                 if self.tools_requiring_face:
                     self.logger.bind(tag=TAG).info(
                         f"需要人脸校验的MCP工具: {self.tools_requiring_face}"
+                    )
+                if self.tools_requiring_speaker:
+                    self.logger.bind(tag=TAG).info(
+                        f"需要声纹校验的MCP工具: {self.tools_requiring_speaker}"
                     )
 
                 self._ready_evt.set()

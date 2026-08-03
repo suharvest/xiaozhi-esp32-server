@@ -131,6 +131,11 @@ class ServerMCPManager:
         if not target_client:
             raise ValueError(f"工具 {tool_name} 在任意MCP服务中未找到")
 
+        # 声纹校验注入：若该工具声明了 meta.requires_speaker，使用当前会话的
+        # 声纹识别结果注入 speaker_name。由 runtime 注入，避免 LLM 伪造身份参数。
+        if target_client.requires_speaker(tool_name):
+            self._inject_session_speaker(tool_name, arguments)
+
         # 人脸校验注入：若该工具声明了 meta.requires_face，先用设备摄像头采集一帧，
         # 注入 face_image_b64 再发往服务端。任一步失败都直接抛错（绝不把空图透传，
         # 否则服务端会按 no_image 拒绝、语义混乱）。
@@ -184,6 +189,19 @@ class ServerMCPManager:
     # 与设备 MCP 客户端缓存的键一致。
     _FACE_EMBEDDING_TOOL = "self.face.capture_embedding"  # 拓扑 B：设备 NPU 算 embedding
     _FACE_CAPTURE_TOOL = "self.camera.capture_raw"        # 拓扑 A：设备只拍图
+
+    def _inject_session_speaker(self, tool_name: str, arguments: Dict[str, Any]) -> None:
+        speaker_name = getattr(self.conn, "current_speaker", None)
+        if not speaker_name or speaker_name == "未知说话人":
+            raise RuntimeError("该操作需要声纹校验，但当前会话未识别到有效说话人")
+
+        # Always overwrite caller-provided identity fields. These fields are
+        # authorization credentials, not user-controlled tool arguments.
+        arguments.pop("speaker_subject_id", None)
+        arguments["speaker_name"] = speaker_name
+        logger.bind(tag=TAG).info(
+            f"工具 {tool_name} 需要声纹，已注入当前说话人: {speaker_name}"
+        )
 
     async def _inject_device_face(self, tool_name: str, arguments: Dict[str, Any]) -> None:
         """采集人脸凭证并注入到工具参数。自动选择拓扑：
