@@ -2,7 +2,9 @@ import asyncio
 from aiohttp import web
 from config.logger import setup_logging
 from core.api.ota_handler import OTAHandler
+from core.api.speaker_handler import SpeakerHandler
 from core.api.vision_handler import VisionHandler
+from core.api.voiceprint_adapter_handler import VoiceprintAdapterHandler
 
 TAG = __name__
 
@@ -12,7 +14,9 @@ class SimpleHttpServer:
         self.config = config
         self.logger = setup_logging()
         self.ota_handler = OTAHandler(config)
+        self.speaker_handler = SpeakerHandler(config)
         self.vision_handler = VisionHandler(config)
+        self.voiceprint_adapter_handler = VoiceprintAdapterHandler(config)
 
     def _get_websocket_url(self, local_ip: str, port: int) -> str:
         """获取websocket地址
@@ -71,6 +75,38 @@ class SimpleHttpServer:
                         ),
                         web.options(
                             "/mcp/vision/explain", self.vision_handler.handle_options
+                        ),
+                        web.get("/api/speaker/latest", self.speaker_handler.handle_latest),
+                        web.get("/api/speaker/events", self.speaker_handler.handle_events),
+                        web.options(
+                            "/api/speaker/latest", self.speaker_handler.handle_options
+                        ),
+                        web.options(
+                            "/api/speaker/events", self.speaker_handler.handle_options
+                        ),
+                        web.get(
+                            "/voiceprint/health",
+                            self.voiceprint_adapter_handler.handle_health,
+                        ),
+                        web.post(
+                            "/voiceprint/register",
+                            self.voiceprint_adapter_handler.handle_register,
+                        ),
+                        web.post(
+                            "/voiceprint/identify",
+                            self.voiceprint_adapter_handler.handle_identify,
+                        ),
+                        web.options(
+                            "/voiceprint/health",
+                            self.voiceprint_adapter_handler.handle_options,
+                        ),
+                        web.options(
+                            "/voiceprint/register",
+                            self.voiceprint_adapter_handler.handle_options,
+                        ),
+                        web.options(
+                            "/voiceprint/identify",
+                            self.voiceprint_adapter_handler.handle_options,
                         ),
                     ]
                 )

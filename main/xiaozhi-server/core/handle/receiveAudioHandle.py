@@ -9,6 +9,7 @@ from core.utils.util import audio_to_data
 from core.handle.abortHandle import handleAbortMessage
 from core.handle.intentHandler import handle_user_intent
 from core.utils.output_counter import check_device_output_limit
+from core.utils.speaker_state import record_speaker_result
 from core.handle.sendAudioHandle import send_stt_message, SentenceType
 
 TAG = __name__
@@ -40,6 +41,7 @@ async def startToChat(conn: "ConnectionHandler", text):
     # 检查输入是否是JSON格式（包含说话人信息）
     speaker_name = None
     language_tag = None
+    speaker_content = None
     actual_text = text
 
     try:
@@ -48,6 +50,7 @@ async def startToChat(conn: "ConnectionHandler", text):
             data = json.loads(text)
             if "speaker" in data and "content" in data:
                 speaker_name = data["speaker"]
+                speaker_content = data["content"]
                 language_tag = data["language"]
                 actual_text = data["content"]
                 conn.logger.bind(tag=TAG).info(f"解析到说话人信息: {speaker_name}")
@@ -61,6 +64,12 @@ async def startToChat(conn: "ConnectionHandler", text):
     # 保存说话人信息到连接对象
     if speaker_name:
         conn.current_speaker = speaker_name
+        record_speaker_result(
+            session_id=conn.session_id,
+            device_id=conn.headers.get("device-id"),
+            speaker=speaker_name,
+            content=speaker_content or actual_text,
+        )
     else:
         conn.current_speaker = None
 

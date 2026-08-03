@@ -197,6 +197,23 @@ voiceprint:
   # 数值越高越严格，减少误识别但可能增加拒识率
   similarity_threshold: 0.4
 
+# 本地声纹适配层：兼容 voiceprint-api 协议，内部调用 seeed-local-voice CAM++。
+# 使用方式：
+# 1. 先启动 seeed-local-voice，确认 http://127.0.0.1:8621/speaker/embedding 可用。
+# 2. 将上面的 voiceprint.url 设置为:
+#    http://127.0.0.1:8003/voiceprint/health?key=your-key
+# 3. 调用 POST /voiceprint/register 注册 speaker_id；识别仍走现有 xiaozhi 声纹链路。
+voiceprint_adapter:
+  # seeed-local-voice 的 CAM++ embedding 接口
+  embedding_url: "http://127.0.0.1:8621/speaker/embedding"
+  # 如果 seeed-local-voice 配了 OVS_API_KEYS，在这里填对应 key
+  embedding_api_key: ""
+  # 适配层自己的 key；为空时会复用 voiceprint.url 里的 ?key=
+  api_key: ""
+  # 注册后的 speaker embedding 存储位置
+  storage_path: "data/voiceprint_embeddings.json"
+  timeout: 10
+
 # #####################################################################################
 # ################################以下是角色模型配置######################################
 
