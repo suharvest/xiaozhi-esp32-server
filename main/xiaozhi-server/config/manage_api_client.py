@@ -73,6 +73,7 @@ class ManageApiClient:
                     },
                     timeout=cls.config.get("timeout", 30),
                     limits=limits,  # 使用限制
+                    trust_env=False,
                 )
             return cls._async_clients[loop_id]
         except RuntimeError:
@@ -242,6 +243,20 @@ async def report(
         )
     except Exception as e:
         print(f"TTS上报失败: {e}")
+        return None
+
+
+async def lookup_address_book(caller_mac: str, nickname: str) -> Optional[Dict]:
+    """根据昵称查找目标设备"""
+    if not ManageApiClient._instance:
+        return None
+    try:
+        return await ManageApiClient._instance._execute_async_request(
+            "GET",
+            f"/device/address-book/lookup?callerMac={caller_mac}&nickname={nickname}",
+        )
+    except Exception as e:
+        print(f"通讯录查找失败: {e}")
         return None
 
 

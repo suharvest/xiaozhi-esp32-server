@@ -99,18 +99,6 @@ const routes = [
     }
   },
   {
-    path: '/knowledge-file-upload',
-    name: 'KnowledgeFileUpload',
-    component: function () {
-      return import('../views/KnowledgeFileUpload.vue')
-    },
-    meta: {
-      requiresAuth: true,
-      title: '文档上传管理'
-    }
-  },
-
-  {
     path: '/server-side-management',
     name: 'ServerSideManager',
     component: function () {
@@ -208,6 +196,18 @@ const routes = [
       title: '替换词管理'
     }
   },
+  // 通讯录管理页面路由
+  {
+    path: '/address-book-management',
+    name: 'AddressBookManagement',
+    component: function () {
+      return import('../views/AddressBookManagement.vue')
+    },
+    meta: {
+      requiresAuth: true,
+      title: '通讯录管理'
+    }
+  },
 ]
 const router = new VueRouter({
   base: process.env.VUE_APP_PUBLIC_PATH || '/',
@@ -229,7 +229,7 @@ VueRouter.prototype.push = function push(location) {
 }
 
 // 需要登录才能访问的路由
-const protectedRoutes = ['home', 'RoleConfig', 'DeviceManagement', 'UserManagement', 'ModelConfig', 'KnowledgeBaseManagement', 'KnowledgeFileUpload']
+const protectedRoutes = ['home', 'RoleConfig', 'DeviceManagement', 'UserManagement', 'ModelConfig', 'KnowledgeBaseManagement', 'KnowledgeFileUpload', 'AddressBookManagement']
 
 // 路由守卫
 router.beforeEach((to, from, next) => {

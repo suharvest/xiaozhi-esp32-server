@@ -132,6 +132,7 @@ class Dialogue:
             self,
             memory_str: str = None,
             voiceprint_config: dict = None,
+            current_speaker: str = None,
             max_history_turns: int = None,
     ) -> List[Dict[str, str]]:
         # 构建对话
@@ -184,9 +185,13 @@ class Dialogue:
 
             # 追加说话人信息
             try:
-                speakers = voiceprint_config.get("speakers", [])
-                if speakers:
-                    dynamic_part += "\n<speakers_info>"
+                current_speaker_name = (current_speaker or "").strip()
+                # 仅在本轮注入了有效身份时才输出 speakers_info，避免列表里的名字每轮
+                # 重复出现诱导模型反复称呼；后续轮不再注入身份，靠对话历史首轮保留
+                if current_speaker_name and current_speaker_name != "未知说话人":
+                    speakers = voiceprint_config.get("speakers", [])
+                    speakers_info = "\n<speakers_info>"
+                    speakers_info += f"\n当前说话人：{current_speaker_name}"
                     for speaker_str in speakers:
                         try:
                             parts = speaker_str.split(",", 2)
@@ -195,10 +200,11 @@ class Dialogue:
                                 description = (
                                     parts[2].strip() if len(parts) >= 3 else ""
                                 )
-                                dynamic_part += f"\n- {name}：{description}"
+                                speakers_info += f"\n- {name}：{description}"
                         except:
                             pass
-                    dynamic_part += "\n</speakers_info>"
+                    speakers_info += "\n</speakers_info>"
+                    dynamic_part += speakers_info
             except:
                 pass
 

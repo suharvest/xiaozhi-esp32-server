@@ -1,6 +1,7 @@
 import json
 import time
 import asyncio
+import opuslib_next
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -47,7 +48,8 @@ async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text
         conn.logger.bind(tag=TAG).info(f"发送音频消息: {sentenceType}, {text}")
 
     # 发送结束消息（如果是最后一个文本）
-    if sentenceType == SentenceType.LAST:
+    # 通话需要维持speaking状态
+    if not conn.calling and sentenceType == SentenceType.LAST:
         await send_tts_message(conn, "stop", None)
         if conn.close_after_chat:
             await conn.close()
@@ -80,13 +82,24 @@ async def _send_to_mqtt_gateway(
     conn: "ConnectionHandler", opus_packet, timestamp, sequence
 ):
     """
-    发送带16字节头部的opus数据包给mqtt_gateway
+    发送带16字节头部的opus数据包给mqtt_gateway，同时缓存音频用于AEC处理
     Args:
         conn: 连接对象
         opus_packet: opus数据包
         timestamp: 时间戳
         sequence: 序列号
     """
+    # 如果启用了服务端AEC，缓存PCM数据用于后续AEC处理
+    if conn.client_aec and timestamp > 0:
+        if not hasattr(conn, "aec_audio_cache"):
+            conn.aec_audio_cache = {}
+            conn.aec_audio_cache_time = {}
+            conn._send_opus_decoder = opuslib_next.Decoder(16000, 1)
+        # 解码opus为PCM后缓存
+        pcm_data = conn._send_opus_decoder.decode(bytes(opus_packet), 960)
+        conn.aec_audio_cache[timestamp] = bytes(pcm_data)
+        conn.aec_audio_cache_time[timestamp] = time.time()
+
     # 为opus数据包添加16字节头部
     header = bytearray(16)
     header[0] = 1  # type
