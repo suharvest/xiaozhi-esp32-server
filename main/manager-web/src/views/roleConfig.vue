@@ -362,7 +362,12 @@
                     </el-form-item>
                     <div class="model-row">
                       <!-- 语言筛选器 -->
-                      <el-form-item class="model-item language-select-item">
+                      <!-- OpenVoiceStream 的音色由「OVS Speaker」实时探测下发，不走
+                           ai_tts_voice 表；该表里 OVS 一行都没有，所以这两个选择器在
+                           OVS 下永远是空的（且可能残留上一个 TTS 模型的脏值）。
+                           两个音色框、一个永远空着，只会让人以为配置坏了 —— 直接隐藏。
+                           注意是隐藏而不是清空：切回 EdgeTTS 之类时原来选的音色还在。 -->
+                      <el-form-item v-if="!isOpenVoiceStreamTts" class="model-item language-select-item">
                         <template #label>
                           <el-tooltip :content="$t('roleConfig.tooltip.language')" placement="top" effect="light" popper-class="custom-tooltip">
                             <span>{{ $t('roleConfig.language') }}</span>
@@ -386,8 +391,8 @@
                         </div>
                       </el-form-item>
 
-                      <!-- 音色选择器 -->
-                      <el-form-item class="model-item">
+                      <!-- 音色选择器（同上：OVS 下隐藏，改由 OVS Speaker 负责） -->
+                      <el-form-item v-if="!isOpenVoiceStreamTts" class="model-item">
                         <template #label>
                           <el-tooltip :content="$t('roleConfig.tooltip.voiceType')" placement="top" effect="light" popper-class="custom-tooltip">
                             <span>{{ $t('roleConfig.voiceType') }}</span>
