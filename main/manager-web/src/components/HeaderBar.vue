@@ -83,14 +83,6 @@
           }" />
           <span class="nav-text">{{ $t("header.knowledgeBase") }}</span>
         </div>
-        <div v-if="userInfo.superAdmin" class="equipment-management"
-          :class="{ 'active-tab': $route.path === '/face-library' }" @click="handleRouter('faceLibrary')">
-          <img loading="lazy" alt="" src="@/assets/header/user_management.png" :style="{
-            filter:
-              $route.path === '/face-library' ? 'brightness(0) invert(1)' : 'None',
-          }" />
-          <span class="nav-text">{{ $t("header.faceLibrary") }}</span>
-        </div>
         <div v-if="featureStatus.addressBook" class="equipment-management"
           :class="{ 'active-tab': $route.path === '/address-book-management' }"
           @click="handleRouter('addressBookManagement')">
@@ -217,7 +209,6 @@ export default {
         modelConfig: "/model-config",
         knowledgeBaseManagement: "/knowledge-base-management",
         addressBookManagement: "/address-book-management",
-        faceLibrary: "/face-library",
         voiceCloneManagement: "/voice-clone-management",
         voiceResourceManagement: "/voice-resource-management",
         paramManagement: "/params-management",

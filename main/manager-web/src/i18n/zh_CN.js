@@ -12,7 +12,6 @@ export default {
   'header.voiceResourceManagement': '音色资源',
   'header.modelConfig': '模型配置',
   'header.knowledgeBase': '知识库',
-  'header.faceLibrary': '人脸库',
   'header.userManagement': '用户管理',
   'header.otaManagement': 'OTA管理',
   'header.paramDictionary': '参数字典',

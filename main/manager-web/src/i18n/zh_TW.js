@@ -10,7 +10,6 @@ export default {
   'header.smartManagement': '智能體管理',
   'header.modelConfig': '模型配置',
   'header.knowledgeBase': '知識庫',
-  'header.faceLibrary': '人臉庫',
   'header.userManagement': '用戶管理',
   'header.voiceCloneManagement': '音色克隆',
   'header.voiceResourceManagement': '音色資源',

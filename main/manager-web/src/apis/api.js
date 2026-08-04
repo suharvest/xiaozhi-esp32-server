@@ -13,7 +13,6 @@ import voiceResource from './module/voiceResource.js'
 import knowledgeBase from './module/knowledgeBase.js'
 import correctWord from './module/correctWord.js'
 import addressBook from './module/addressBook.js'
-import faceLibrary from './module/faceLibrary.js'
 
 
 
@@ -48,6 +47,5 @@ export default {
     knowledgeBase,
     correctWord,
     addressBook,
-    faceLibrary,
     probe
   }

@@ -52,7 +52,7 @@ import xiaozhi.modules.model.dto.ModelProbeDTO;
  * <h3>响应约定</h3>
  * <p>
  * HTTP 层**始终返回 200**，成功与失败都靠 {@code Result.code} 区分
- * （与 {@code FaceLibraryController} 一致）：前端 {@code httpRequest.js} 会把非 200
+ * ：前端 {@code httpRequest.js} 会把非 200
  * 的响应吞进全局错误处理器弹 toast，探测失败需要在表单内联展示，不能走那条路。
  * 失败时 {@code code} 用上游状态码（401 / 503 …），{@code msg} 用上游的错误原因。
  * </p>

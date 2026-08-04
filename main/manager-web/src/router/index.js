@@ -26,13 +26,6 @@ const routes = [
     }
   },
   {
-    path: '/face-library',
-    name: 'FaceLibrary',
-    component: function () {
-      return import('../views/FaceLibrary.vue')
-    }
-  },
-  {
     path: '/login',
     name: 'login',
     component: function () {
@@ -236,7 +229,7 @@ VueRouter.prototype.push = function push(location) {
 }
 
 // 需要登录才能访问的路由
-const protectedRoutes = ['home', 'RoleConfig', 'DeviceManagement', 'UserManagement', 'ModelConfig', 'KnowledgeBaseManagement', 'KnowledgeFileUpload', 'AddressBookManagement', 'FaceLibrary']
+const protectedRoutes = ['home', 'RoleConfig', 'DeviceManagement', 'UserManagement', 'ModelConfig', 'KnowledgeBaseManagement', 'KnowledgeFileUpload', 'AddressBookManagement']
 
 // 路由守卫
 router.beforeEach((to, from, next) => {

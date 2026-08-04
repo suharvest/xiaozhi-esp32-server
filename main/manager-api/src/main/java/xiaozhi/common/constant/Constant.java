@@ -137,12 +137,6 @@ public interface Constant {
     String SERVER_VOICE_PRINT = "server.voice_print";
 
     /**
-     * 仓管系统人脸库接口地址（形如 http://host:port/api?key=xxx）
-     * key 仅在服务端使用，绝不下发给前端
-     */
-    String SERVER_FACE_WAREHOUSE = "server.face_warehouse";
-
-    /**
      * mqtt密钥
      */
     String SERVER_MQTT_SECRET = "server.mqtt_signature_key";
