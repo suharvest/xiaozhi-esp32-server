@@ -27,6 +27,7 @@ import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.extern.slf4j.Slf4j;
 import xiaozhi.common.constant.Constant;
 import xiaozhi.common.utils.Result;
+import xiaozhi.common.utils.UpstreamStatus;
 import xiaozhi.modules.sys.service.SysParamsService;
 
 /**
@@ -203,8 +204,10 @@ public class FaceLibraryController {
             if (status >= 200 && status < 300) {
                 return new Result<Object>().ok(parseBody(body));
             }
-            // 原样回显仓管系统的错误码与错误信息（前端据此识别 FACE_ENABLED=false 的 404）
-            return new Result<Object>().error(status, extractDetail(body, status));
+            // 回显仓管系统的错误码与错误信息（前端据此识别 FACE_ENABLED=false 的 404）。
+            // 401/403 必须经 UpstreamStatus.remap 挪出保留区间：前端把 code==401 当作本站
+            // 登录态失效处理会直接把管理员踢下线，而这里的 401 只是仓管系统的 key 填错了。
+            return new Result<Object>().error(UpstreamStatus.remap(status), extractDetail(body, status));
         } catch (Exception e) {
             log.error("调用仓管系统人脸接口失败 {} {}：{}", method, subPath, e.getMessage());
             return new Result<Object>().error(503, "仓管系统不可达：" + e.getMessage());
