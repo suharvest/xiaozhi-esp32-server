@@ -86,6 +86,9 @@
                     <el-option :label="$t('providerDialog.booleanType')" value="boolean"></el-option>
                     <el-option :label="$t('providerDialog.dictType')" value="dict"></el-option>
                     <el-option :label="$t('providerDialog.arrayType')" value="array"></el-option>
+                    <!-- DynamicField 新增控件类型（见 @/utils/dynamicField.js） -->
+                    <el-option v-for="opt in widgetTypeOptions" :key="opt.value" :label="opt.label"
+                      :value="opt.value"></el-option>
                   </el-select>
                 </template>
                 <template v-else>
@@ -125,6 +128,7 @@
 
 <script>
 import CustomDialog from './CustomDialog.vue';
+import { widgetTypeOptions, widgetTypeLabel } from '@/utils/dynamicField';
 export default {
   name: 'ProviderDialog',
   props: {
@@ -151,6 +155,9 @@ export default {
         name: [{ required: true, message: this.$t('providerDialog.requiredName'), trigger: 'blur' }]
       };
     },
+    widgetTypeOptions() {
+      return widgetTypeOptions(this.$i18n && this.$i18n.locale);
+    },
     hasIncompleteFields() {
       return this.form.fields && this.form.fields.some(field =>
         !field.key || !field.label || !field.type
@@ -167,7 +174,7 @@ export default {
         'array': this.$t('providerDialog.arrayType'),
         'RAG': this.$t('providerDialog.ragType')
       };
-      return typeMap[type];
+      return typeMap[type] || widgetTypeLabel(type, this.$i18n && this.$i18n.locale) || type;
     },
 
     startEditing(row) {

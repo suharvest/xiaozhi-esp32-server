@@ -76,9 +76,14 @@
       <el-form :model="formData.configJson" label-width="auto" label-position="left" class="custom-form">
         <div v-for="(row, rowIndex) in chunkedCallInfoFields" :key="rowIndex" class="form-row">
           <el-form-item v-for="field in row" :key="field.prop" :label="field.label" :prop="field.prop" style="flex: 1;">
-            <el-input v-model="formData.configJson[field.prop]" :placeholder="field.placeholder"
-              :type="field.type || 'text'" class="custom-input-bg" :show-password="field.type === 'password'">
-            </el-input>
+            <dynamic-field :field="field" :value="formData.configJson[field.prop]"
+              :json-value="fieldJsonMap[field.prop] || ''" :config-json="formData.configJson"
+              :remote-options="remoteOptionsMap[field.prop]" :loading="!!remoteLoadingMap[field.prop]"
+              :error-message="remoteErrorMap[field.prop] || ''" input-class="custom-input-bg"
+              @input="(val) => $set(formData.configJson, field.prop, val)"
+              @json-input="(val) => $set(fieldJsonMap, field.prop, val)"
+              @json-change="(val) => handleJsonChange(field.prop, val)"
+              @probe="handleFieldProbe(field, formData.configJson)"></dynamic-field>
           </el-form-item>
         </div>
       </el-form>
@@ -89,11 +94,16 @@
 <script>
 import Api from '@/apis/api';
 import CustomDialog from './CustomDialog.vue';
+import DynamicField from './DynamicField.vue';
+import dynamicFieldProbe from '@/mixins/dynamicFieldProbe';
+import { resolveWidget, isFieldVisible, fieldDefault } from '@/utils/dynamicField';
 export default {
   name: 'AddModelDialog',
   components: {
-    CustomDialog
+    CustomDialog,
+    DynamicField
   },
+  mixins: [dynamicFieldProbe],
   props: {
     visible: { type: Boolean, required: true },
     modelType: { type: String, required: true }
@@ -106,6 +116,7 @@ export default {
       providersLoaded: false,
       providerFields: [],
       currentProvider: null,
+      fieldJsonMap: {},
       formData: {
         id: '',
         modelName: '',
@@ -142,8 +153,9 @@ export default {
     chunkedCallInfoFields() {
       const chunkSize = 2;
       const result = [];
-      for (let i = 0; i < this.dynamicCallInfoFields.length; i += chunkSize) {
-        result.push(this.dynamicCallInfoFields.slice(i, i + chunkSize));
+      const fields = this.dynamicCallInfoFields.filter(f => isFieldVisible(f, this.formData.configJson));
+      for (let i = 0; i < fields.length; i += chunkSize) {
+        result.push(fields.slice(i, i + chunkSize));
       }
       return result;
     }
@@ -157,11 +169,14 @@ export default {
         this.providers = data.map(item => ({
           label: item.name,
           value: item.providerCode,
+          // 类型原样透传给 DynamicField，不再塌缩成 password/text。
+          // dictFallback: 'text' —— 本弹窗改动前把 dict 也渲染成普通文本框，外观保持不变
           fields: JSON.parse(item.fields || '[]').map(f => ({
+            ...f,
             label: f.label,
             prop: f.key,
-            type: f.type === 'password' ? 'password' : 'text',
-            placeholder: `请输入${f.key}`
+            widget: resolveWidget(f, { dictFallback: 'text' }),
+            placeholder: f.placeholder || `请输入${f.key}`
           }))
         }))
         this.providersLoaded = true
@@ -170,9 +185,22 @@ export default {
     initConfigJson() {
       const defaultConfig = {};
       this.providerFields.forEach(field => {
-        defaultConfig[field.prop] = '';
+        // fieldDefault 对存量字段恒返回 ''，与改动前一致
+        defaultConfig[field.prop] = fieldDefault(field);
       });
       this.formData.configJson = { ...defaultConfig };
+    },
+
+    // json-textarea 控件：把用户输入的字符串解析回对象存进 configJson
+    handleJsonChange(prop, value) {
+      try {
+        const parsed = JSON.parse(value);
+        if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+          this.$set(this.formData.configJson, prop, parsed);
+        }
+      } catch (e) {
+        // 解析失败保留原值，与 ModelEditDialog 一致（不阻塞用户继续编辑）
+      }
     },
 
     handleClose() {
@@ -183,9 +211,14 @@ export default {
     initDynamicConfig() {
       const newConfig = {};
       this.providerFields.forEach(field => {
-        newConfig[field.prop] = this.formData.configJson[field.prop] || '';
+        const current = this.formData.configJson[field.prop];
+        newConfig[field.prop] = current === undefined || current === null || current === ''
+          ? fieldDefault(field)
+          : current;
       });
       this.formData.configJson = newConfig;
+      this.fieldJsonMap = {};
+      this.resetRemoteOptions();
     },
     confirm() {
       this.saving = true;
@@ -250,6 +283,8 @@ export default {
       // 重置字段配置
       this.providerFields = [];
       this.currentProvider = null;
+      this.fieldJsonMap = {};
+      this.resetRemoteOptions();
     },
     
     // 校验模型ID：不能为纯文字或空格

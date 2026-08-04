@@ -5,6 +5,7 @@ import device from './module/device.js'
 import dict from './module/dict.js'
 import model from './module/model.js'
 import ota from './module/ota.js'
+import probe from './module/probe.js'
 import timbre from "./module/timbre.js"
 import user from './module/user.js'
 import voiceClone from './module/voiceClone.js'
@@ -47,5 +48,6 @@ export default {
     knowledgeBase,
     correctWord,
     addressBook,
-    faceLibrary
+    faceLibrary,
+    probe
   }

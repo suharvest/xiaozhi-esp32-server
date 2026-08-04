@@ -67,28 +67,14 @@
         <div v-for="(row, rowIndex) in chunkedCallInfoFields" :key="rowIndex" class="form-row">
           <el-form-item v-for="field in row" :key="field.prop" :label="field.label" :prop="field.prop"
             style="flex: 1">
-            <template v-if="field.type === 'json-textarea'">
-              <el-input v-model="fieldJsonMap[field.prop]" type="textarea" :rows="3"
-                :placeholder="$t('modelConfigDialog.enterJsonExample')"
-                @change="(val) => handleJsonChange(field.prop, val)" @focus="
-                  isSensitiveField(field.prop)
-                    ? handleJsonInputFocus(field.prop, fieldJsonMap[field.prop])
-                    : undefined
-                  " @blur="
-                  isSensitiveField(field.prop)
-                    ? handleJsonInputBlur(field.prop)
-                    : undefined
-                  "></el-input>
-            </template>
-
-            <el-input v-else v-model="form.configJson[field.prop]" :placeholder="field.placeholder" :type="field.type"
-              :show-password="field.type === 'password'" @focus="
-                isSensitiveField(field.prop)
-                  ? handleInputFocus(field.prop, form.configJson[field.prop])
-                  : undefined
-                " @blur="
-                isSensitiveField(field.prop) ? handleInputBlur(field.prop) : undefined
-                "></el-input>
+            <dynamic-field :field="field" :value="form.configJson[field.prop]" :json-value="fieldJsonMap[field.prop]"
+              :config-json="form.configJson" :remote-options="remoteOptionsMap[field.prop]"
+              :loading="!!remoteLoadingMap[field.prop]" :error-message="remoteErrorMap[field.prop] || ''"
+              @input="(val) => $set(form.configJson, field.prop, val)"
+              @json-input="(val) => $set(fieldJsonMap, field.prop, val)"
+              @json-change="(val) => handleJsonChange(field.prop, val)"
+              @focus="handleFieldFocus(field)" @blur="handleFieldBlur(field)"
+              @probe="handleFieldProbe(field, form.configJson)"></dynamic-field>
           </el-form-item>
         </div>
       </template>
@@ -99,11 +85,15 @@
 
 <script>
 import CustomDialog from './CustomDialog.vue';
+import DynamicField from './DynamicField.vue';
+import dynamicFieldProbe from '@/mixins/dynamicFieldProbe';
+import { resolveWidget, isFieldVisible, fieldDefault } from '@/utils/dynamicField';
 import Api from "@/apis/api";
 
 export default {
   name: "ModelEditDialog",
-  components: { CustomDialog },
+  components: { CustomDialog, DynamicField },
+  mixins: [dynamicFieldProbe],
   props: {
     visible: { type: Boolean, default: false },
     modelData: {
@@ -157,8 +147,11 @@ export default {
     chunkedCallInfoFields() {
       const chunkSize = 2;
       const result = [];
-      for (let i = 0; i < this.dynamicCallInfoFields.length; i += chunkSize) {
-        result.push(this.dynamicCallInfoFields.slice(i, i + chunkSize));
+      const fields = this.dynamicCallInfoFields.filter((f) =>
+        isFieldVisible(f, this.form.configJson)
+      );
+      for (let i = 0; i < fields.length; i += chunkSize) {
+        result.push(fields.slice(i, i + chunkSize));
       }
       return result;
     },
@@ -208,6 +201,7 @@ export default {
         configJson: {},
       };
       this.fieldJsonMap = {};
+      this.resetRemoteOptions();
     },
     resetProviders() {
       this.providers = [];
@@ -305,16 +299,14 @@ export default {
           (p) => p.providerCode === providerCode
         );
         if (provider) {
+          // 不再把类型塌缩成 text/password/json-textarea，原样透传给 DynamicField，
+          // 由 @/utils/dynamicField 的 resolveWidget 决定控件（存量类型行为不变）
           this.dynamicCallInfoFields = JSON.parse(provider.fields || "[]").map((f) => ({
+            ...f,
             label: f.label,
             prop: f.key,
-            type:
-              f.type === "dict"
-                ? "json-textarea"
-                : f.type === "password"
-                  ? "password"
-                  : "text",
-            placeholder: `请输入${f.key}`,
+            widget: resolveWidget(f),
+            placeholder: f.placeholder || `请输入${f.key}`,
           }));
 
           if (this.pendingModelData && this.pendingProviderType === providerCode) {
@@ -329,15 +321,20 @@ export default {
       let configJson = model.configJson || {};
       this.dynamicCallInfoFields.forEach((field) => {
         if (!configJson.hasOwnProperty(field.prop)) {
-          configJson[field.prop] = "";
-        } else if (field.type === "json-textarea") {
+          // 存量字段 fieldDefault 恒返回 ""，与改动前一致；只有接入新 schema 的字段才读 default
+          configJson[field.prop] = fieldDefault(field);
+        } else if (field.widget === "json-textarea") {
           this.$set(
             this.fieldJsonMap,
             field.prop,
             this.formatJson(configJson[field.prop])
           );
           configJson[field.prop] = this.ensureObject(configJson[field.prop]);
-        } else if (typeof configJson[field.prop] !== "string") {
+        } else if (
+          field.widget !== "number" &&
+          field.widget !== "boolean" &&
+          typeof configJson[field.prop] !== "string"
+        ) {
           configJson[field.prop] = String(configJson[field.prop]);
         }
       });
@@ -354,6 +351,24 @@ export default {
         sort: Number(model.sort) || 0,
         configJson: { ...configJson },
       };
+    },
+    // DynamicField 只透传 focus/blur，敏感字段掩码逻辑仍留在本组件，
+    // 这两个方法把原来写在模板里的三元判断原样搬过来，行为不变
+    handleFieldFocus(field) {
+      if (!this.isSensitiveField(field.prop)) return;
+      if (field.widget === "json-textarea") {
+        this.handleJsonInputFocus(field.prop, this.fieldJsonMap[field.prop]);
+      } else {
+        this.handleInputFocus(field.prop, this.form.configJson[field.prop]);
+      }
+    },
+    handleFieldBlur(field) {
+      if (!this.isSensitiveField(field.prop)) return;
+      if (field.widget === "json-textarea") {
+        this.handleJsonInputBlur(field.prop);
+      } else {
+        this.handleInputBlur(field.prop);
+      }
     },
     handleJsonChange(field, value) {
       const parsed = this.validateJson(value);
