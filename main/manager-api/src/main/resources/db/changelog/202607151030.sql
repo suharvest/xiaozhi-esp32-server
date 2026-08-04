@@ -1,5 +1,5 @@
---liquibase formatted sql
---changeset xiaozhi:202607151030-1
+-- liquibase formatted sql
+-- changeset xiaozhi:202607151030-1
 -- 仓管系统人脸库接口地址（形如 http://host:port/api?key=xxx）
 -- key 仅在 manager-api 服务端使用，绝不下发给前端
 -- id 取 9xxx 段：这是 fork 自有的参数，上游的 sys_params id 目前在 100~5xx 段递增，
