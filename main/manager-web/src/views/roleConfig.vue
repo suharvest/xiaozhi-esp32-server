@@ -629,15 +629,9 @@ export default {
   computed: {
     // 判定当前选中的 TTS 模型是否为 OpenVoiceStream
     isOpenVoiceStreamTts() {
-      const ttsModels = (this.modelOptions && this.modelOptions.TTS) || [];
-      const ttsModelId = this.form && this.form.model && this.form.model.ttsModelId;
-      const selected = ttsModels.find(m => (m.id || m.value) === ttsModelId);
-      if (!selected) return false;
-      // 主路径：依赖 Java 端扩展的 ModelBasicInfoDTO.type 字段
-      if (selected.type === 'openvoicestream_tts') return true;
-      // Fallback：DTO 还没扩展时，按 modelName / label grep 关键字兜底
-      const nameStr = `${selected.modelName || ''} ${selected.label || ''}`.toLowerCase();
-      return nameStr.includes('openvoicestream');
+      return this.isOvsTtsModelId(
+        this.form && this.form.model && this.form.model.ttsModelId
+      );
     },
     configInteractionBlocked() {
       return this.agentReloading
@@ -1144,8 +1138,33 @@ export default {
         }
       });
     },
+    /** 给定的 TTS 模型是否是 OpenVoiceStream。传 modelId 而不是读 form，
+     *  因为切换模型时 fetchVoiceOptions 会先于 form 更新被调用。 */
+    isOvsTtsModelId(modelId) {
+      const ttsModels = (this.modelOptions && this.modelOptions.TTS) || [];
+      const selected = ttsModels.find(m => (m.id || m.value) === modelId);
+      if (!selected) return false;
+      // 主路径：依赖 Java 端扩展的 ModelBasicInfoDTO.type 字段
+      if (selected.type === 'openvoicestream_tts') return true;
+      // Fallback：DTO 还没扩展时，按 modelName / label grep 关键字兜底
+      const nameStr = `${selected.modelName || ''} ${selected.label || ''}`.toLowerCase();
+      return nameStr.includes('openvoicestream');
+    },
     fetchVoiceOptions(modelId, options = {}) {
       const requestSeq = ++this.voiceFetchSeq;
+      // OpenVoiceStream 的音色来自设备实时探测（见「OVS Speaker」选择器），
+      // 不走 ai_tts_voice 表 —— 那张表里 OVS 一行都没有，去查必然拿到空结果并
+      // 弹出「获取音色列表失败」。选择器本身已在模板里隐藏，这里把对应的数据获取
+      // 也一并停掉，否则就是「UI 藏了、后台还在报错」。
+      if (this.isOvsTtsModelId(modelId)) {
+        this.voiceOptionsLoading = false;
+        this.voiceOptions = [];
+        this.voiceDetails = {};
+        this.languageOptions = [];
+        this.selectedLanguage = '';
+        this.lastValidTtsDraft = this.captureTtsDraft();
+        return;
+      }
       if (!modelId) {
         this.voiceOptionsLoading = false;
         this.voiceOptions = [];
