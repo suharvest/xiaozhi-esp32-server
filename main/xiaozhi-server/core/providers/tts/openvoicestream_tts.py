@@ -7,7 +7,7 @@ import asyncio
 import traceback
 from typing import Optional
 from config.logger import setup_logging
-from core.utils.tts import MarkdownCleaner
+from core.utils.tts import MarkdownCleaner, convert_percentage_to_range
 from core.providers.tts.base import TTSProviderBase
 from core.utils import opus_encoder_utils, textUtils
 from core.providers.tts.dto.dto import SentenceType, ContentType, InterfaceType
@@ -77,6 +77,42 @@ class TTSProvider(TTSProviderBase):
         # Optional extras — only forwarded when not None
         pitch = config.get("pitch", None)
         self.pitch = float(pitch) if pitch is not None else None
+
+        # 角色级的语速/音调覆盖模型级配置。
+        #
+        # 智控台「角色配置」里有音量/语速/音调三个滑块，manager-api 会把它们作为
+        # ttsVolume / ttsRate / ttsPitch 注入 TTS config（ConfigServiceImpl:475-480）。
+        # 在此之前只有火山双流一家消费这三个键，所以用户拖了滑块对 OVS 毫无反应 ——
+        # 又是一个「配了没用」的坑。这里对齐上游语义把它接上。
+        #
+        # 量纲换算（两边完全不同，直接透传会得到荒唐的值）：
+        #   ttsRate  百分比 -100~100  → OVS speed 倍率，合法区间 [0.25, 4.0]
+        #       取 0.5~2.0、基准 1.0：这是听感上合理的范围。不用 0.25~4.0——那是
+        #       服务端的**校验上限**，拿它当滑块量程会让 ±20% 的微调变成剧变。
+        #   ttsPitch 百分比 -100~100  → OVS pitch 半音，合法区间 [-24, 24]
+        #       取 ±12（一个八度），与火山双流的选择一致，也稳在服务端限制内。
+        #   ttsVolume → **OVS 没有音量字段**（TTSRequest 里根本不存在），无法支持。
+        if "ttsRate" in config and config["ttsRate"] is not None:
+            self.speed = round(
+                convert_percentage_to_range(
+                    config["ttsRate"], min_val=0.5, max_val=2.0, base_val=1.0
+                ),
+                3,
+            )
+        if "ttsPitch" in config and config["ttsPitch"] is not None:
+            self.pitch = round(
+                convert_percentage_to_range(
+                    config["ttsPitch"], min_val=-12.0, max_val=12.0, base_val=0.0
+                ),
+                3,
+            )
+        if config.get("ttsVolume") not in (None, 0):
+            # 说清楚而不是静默忽略：用户拖了音量滑块，得知道它为什么没反应。
+            logger.bind(tag=TAG).warning(
+                "OpenVoiceStream 不支持音量调节（服务端 TTSRequest 无 volume 字段），"
+                f"角色配置里的音量设置 {config.get('ttsVolume')} 将被忽略；"
+                "如需调整请在设备端或播放链路上处理"
+            )
         language = config.get("language", None)
         self.language = language if language else None
         self.timeout = config.get("timeout", 30)
