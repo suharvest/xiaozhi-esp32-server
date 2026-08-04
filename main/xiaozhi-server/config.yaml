@@ -624,10 +624,12 @@ ASR:
     # 服务端口默认 8621，路径 /asr/stream，参数通过 query string 传递
     type: openvoicestream
     ws_url: ws://127.0.0.1:8621/asr/stream
+    api_key: ""                  # 服务端设了 OVS_API_KEYS 时必填，否则握手被 close 4401
     sample_rate: 16000
     language: auto
     final_timeout: 5.0           # 等待最终识别结果的超时（秒）
-    partial_results: false       # 暂未启用：是否回显中间结果
+    # partial_results 已移除：代码里从未生效（provider 注释自认 reserved），
+    # 留着只会让人以为配了有用。要回显中间结果需要先实现该功能。
     fallback_to_partial: true    # 超时时用最近一次 partial 兜底
     allow_backend_endpoint: false  # 是否允许后端自发的 final（默认只接受 end_utterance 触发的 final）
     output_dir: tmp/
@@ -1205,9 +1207,13 @@ TTS:
     # POST {base_url}/tts/stream，响应体前 4 字节为 LE uint32 采样率，其余为 int16 PCM
     type: openvoicestream_tts
     base_url: http://127.0.0.1:8621
-    # speaker_id: null   # 推荐：int，新协议音色 ID（从 GET /tts/capabilities 获取列表）
+    api_key: ""          # 服务端设了 OVS_API_KEYS 时必填，否则一律 401
+    # speaker_id: null   # 推荐：int，新协议音色 ID（从 GET /tts/speakers 获取列表）
     # speaker_embedding_b64: null  # 可选：voice clone embedding base64；与 speaker_id 互斥，优先级最高
-    sid: 0               # ⚠️ 已废弃：legacy speaker id；新部署用 speaker_id
+    # sid:               # ⚠️ 已废弃：legacy speaker id；新部署用 speaker_id。
+    #                    # 千万别填 0——_to_optional_int(0) 返回 0 而非 None，
+    #                    # 而优先级是 embedding > speaker_id > sid，填 0 会永远
+    #                    # 压住 speaker_id，导致智控台里选的音色不生效。
     speed: 1.0
     pitch: null
     language: null

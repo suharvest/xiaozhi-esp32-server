@@ -54,8 +54,12 @@ class TTSProvider(TTSProviderBase):
     def __init__(self, config, delete_audio_file):
         super().__init__(config, delete_audio_file)
         self.interface_type = InterfaceType.SINGLE_STREAM
-        self.base_url = config.get("base_url", "http://127.0.0.1:8000")
+        # 默认端口 8621：OVS 容器内监听 8000，对外发布的宿主端口是 8621。
+        # 写 8000 会让留空的配置静默连不上。
+        self.base_url = config.get("base_url", "http://127.0.0.1:8621")
         self.api_url = f"{self.base_url}/tts/stream"
+        # OVS_API_KEYS 启用时必须带；留空表示服务端未开鉴权。
+        self.api_key = (config.get("api_key") or "").strip()
         # Speaker selection — priority: embedding > speaker_id > sid (legacy).
         # All default to None so we only send the field user actually set.
         self.speaker_id = _to_optional_int(config.get("speaker_id"))
@@ -206,26 +210,66 @@ class TTSProvider(TTSProviderBase):
         finally:
             return None
 
-    async def _post_with_503_retry(self, session, payload):
-        """POST to /tts/stream with 503 (hot-reload) retry; returns response or None on final failure."""
+    def _auth_headers(self) -> dict:
+        """OVS 的鉴权头。OVS_API_KEYS 未启用时为空。"""
+        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+
+    async def _post_with_retry(self, session, payload):
+        """POST /tts/stream，对两类可恢复状态退避重试：
+
+        - 503：OVS 正在热重载后端
+        - 429：会话槽满（``too_many_sessions``）。OVS 会带 ``Retry-After`` 头。
+          单 worker 的后端（所有 RK 设备、以及任何未覆写 max_concurrent 的后端）
+          一旦被卡住的请求占住唯一 slot，后续全是 429 —— 不退避重试就会整条
+          TTS 链路一起崩掉。
+
+        返回 response；最终失败返回 None。
+        """
         delay = 0.1
         max_delay = 5.0
         max_retries = 3
         for attempt in range(max_retries + 1):
-            resp = await session.post(self.api_url, json=payload)
-            if resp.status != 503:
+            resp = await session.post(
+                self.api_url, json=payload, headers=self._auth_headers()
+            )
+            if resp.status not in (503, 429):
+                if resp.status == 401:
+                    body = await resp.text()
+                    await resp.release()
+                    logger.bind(tag=TAG).error(
+                        f"TTS 返回 401：服务端开启了 OVS_API_KEYS，"
+                        f"但本地 TTS 配置里的 api_key 为空或不正确。body={body[:200]}"
+                    )
+                    return None
                 return resp
+
+            status = resp.status
+            retry_after = resp.headers.get("Retry-After")
             body = await resp.text()
             await resp.release()
+
             if attempt == max_retries:
                 logger.bind(tag=TAG).error(
-                    f"TTS still unavailable after {max_retries} retries: 503, body={body[:200]}"
+                    f"TTS still unavailable after {max_retries} retries: "
+                    f"{status}, body={body[:200]}"
                 )
                 return None
+
+            sleep_for = delay
+            if status == 429 and retry_after:
+                try:
+                    # Retry-After 是服务端的明确指示，优先于我们的退避曲线，
+                    # 但仍夹在 max_delay 内，避免一个离谱的值把这一句挂死。
+                    sleep_for = min(float(retry_after), max_delay)
+                except (TypeError, ValueError):
+                    pass
+
+            reason = "hot-reloading" if status == 503 else "session slots full"
             logger.bind(tag=TAG).warning(
-                f"TTS hot-reloading: 503, retry={attempt + 1}/{max_retries}, sleep={delay:.1f}s"
+                f"TTS {reason}: {status}, retry={attempt + 1}/{max_retries}, "
+                f"sleep={sleep_for:.1f}s"
             )
-            await asyncio.sleep(delay)
+            await asyncio.sleep(sleep_for)
             delay = min(delay * 2, max_delay)
         return None
 
@@ -235,7 +279,13 @@ class TTSProvider(TTSProviderBase):
         try:
             timeout = aiohttp.ClientTimeout(total=5)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as resp:
+                async with session.get(url, headers=self._auth_headers()) as resp:
+                    if resp.status == 401:
+                        logger.bind(tag=TAG).error(
+                            "OVS TTS 返回 401：服务端开启了 OVS_API_KEYS，"
+                            "但本地 TTS 配置里的 api_key 为空或不正确"
+                        )
+                        return
                     if resp.status == 503:
                         logger.bind(tag=TAG).warning(
                             "OVS TTS hot-reload in progress at startup; capabilities skipped"
@@ -278,7 +328,7 @@ class TTSProvider(TTSProviderBase):
         try:
             timeout = aiohttp.ClientTimeout(total=self.timeout)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                resp = await self._post_with_503_retry(session, payload)
+                resp = await self._post_with_retry(session, payload)
                 if resp is None:
                     self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
                     return

@@ -36,9 +36,14 @@ class ASRProvider(ASRProviderBase):
         self.config = config or {}
         self.text = ""
 
+        # 默认端口 8621：OVS 容器内监听 8000，但对外发布的宿主端口是 8621
+        # （deploy/docker-compose.yml 的 "8621:8000"）。写 8000 会让留空的配置
+        # 静默连不上。
         self.ws_url_base = self.config.get(
-            "ws_url", "ws://127.0.0.1:8000/asr/stream"
+            "ws_url", "ws://127.0.0.1:8621/asr/stream"
         )
+        # OVS_API_KEYS 启用时必须带；留空表示服务端未开鉴权。
+        self.api_key = (self.config.get("api_key") or "").strip()
         self.sample_rate = int(self.config.get("sample_rate", 16000))
         self.language = self.config.get("language", "auto")
         self.final_timeout = float(self.config.get("final_timeout", 5.0))
@@ -90,7 +95,13 @@ class ASRProvider(ASRProviderBase):
         try:
             timeout = aiohttp.ClientTimeout(total=5)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as resp:
+                async with session.get(url, headers=self._auth_headers()) as resp:
+                    if resp.status == 401:
+                        logger.bind(tag=TAG).error(
+                            "OVS ASR 返回 401：服务端开启了 OVS_API_KEYS，"
+                            "但本地 ASR 配置里的 api_key 为空或不正确"
+                        )
+                        return
                     if resp.status == 503:
                         logger.bind(tag=TAG).warning(
                             "OVS ASR hot-reload in progress at startup; capabilities skipped"
@@ -114,6 +125,10 @@ class ASRProvider(ASRProviderBase):
     # Connection setup / teardown
     # ------------------------------------------------------------------
 
+    def _auth_headers(self) -> dict:
+        """OVS 的鉴权头。走 header 而不是 ?token=，避免 key 落进日志里的 URL。"""
+        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+
     def _build_ws_url(self) -> str:
         parsed = urlparse(self.ws_url_base)
         existing = dict(parse_qsl(parsed.query))
@@ -128,6 +143,7 @@ class ASRProvider(ASRProviderBase):
         self._conn = conn
         self.asr_ws = await websockets.connect(
             url,
+            additional_headers=self._auth_headers(),
             max_size=1000000000,
             ping_interval=None,
             ping_timeout=None,
@@ -271,9 +287,18 @@ class ASRProvider(ASRProviderBase):
             try:
                 await self._start_session(conn)
             except Exception as e:
-                logger.bind(tag=TAG).error(
-                    f"Failed to open OpenVoiceStream ASR session: {e}"
-                )
+                # OVS 鉴权失败是 accept 之后 close 4401，不是 HTTP 401 —— 单看
+                # 异常文本很难认出来，这里显式翻译，否则现场只会看到"连接失败"。
+                if "4401" in str(e):
+                    logger.bind(tag=TAG).error(
+                        f"ASR 连接被拒(4401 未授权): {self.ws_url_base} —— "
+                        "服务端开启了 OVS_API_KEYS，请在智控台的 ASR 配置里填 api_key"
+                    )
+                else:
+                    logger.bind(tag=TAG).error(
+                        f"ASR 连接失败: {self.ws_url_base} —— {e}。"
+                        "请检查地址/端口是否正确、OVS 服务是否已就绪(/readyz)"
+                    )
                 await self._cleanup()
                 return
 
