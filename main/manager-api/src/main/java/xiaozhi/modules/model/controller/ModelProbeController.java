@@ -417,7 +417,7 @@ public class ModelProbeController {
         for (InetAddress addr : resolved) {
             if (!isAllowedPrivateAddress(addr)) {
                 throw new ProbeRejectedException(400,
-                        "只允许探测内网地址（10/8、172.16/12、192.168/16、127/8、169.254/16、::1、fc00::/7），"
+                        "只允许探测内网地址（10/8、172.16/12、192.168/16、100.64/10、127/8、169.254/16、::1、fc00::/7），"
                                 + "拒绝：" + addr.getHostAddress());
             }
         }
@@ -429,7 +429,7 @@ public class ModelProbeController {
      * 防护 2 的判定：地址是否落在允许的私有段。
      *
      * <p>
-     * IPv4：10/8、172.16/12、192.168/16、127/8、169.254/16。<br>
+     * IPv4：10/8、172.16/12、192.168/16、100.64/10（RFC 6598，Tailscale 用）、127/8、169.254/16。<br>
      * IPv6：::1（回环）、fc00::/7（ULA）、fe80::/10（链路本地，等价于 IPv4 的 169.254/16）。
      * </p>
      *
@@ -491,7 +491,14 @@ public class ModelProbeController {
             if (b0 == 127) {
                 return true; // 127.0.0.0/8
             }
-            return b0 == 169 && b1 == 254; // 169.254.0.0/16
+            if (b0 == 169 && b1 == 254) {
+                return true; // 169.254.0.0/16
+            }
+            // 100.64.0.0/10 —— RFC 6598 Shared Address Space（运营商级 NAT 保留段）。
+            // Tailscale 的 overlay 网络就用这一段，而边缘设备（Jetson / RK / RPi）
+            // 常常只能通过 Tailscale 触达 —— 实测 orin-nx 就是 100.82.225.102。
+            // 放行它不等于开放公网：这段地址由 IANA 保留、公网不可路由。
+            return b0 == 100 && b1 >= 64 && b1 <= 127;
         }
         if (addr instanceof Inet6Address) {
             if (addr.isLoopbackAddress()) {

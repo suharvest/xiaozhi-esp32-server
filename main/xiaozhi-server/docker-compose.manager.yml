@@ -63,5 +63,21 @@ services:
       retries: 3
     networks:
       - default
+  # MCP 接入点模块
+  # 外部 MCP server（如仓管系统的 mcp_pipe.py）连到这里，按 agent 挂载工具。
+  # 智控台在「参数管理 → server.mcp_endpoint」里填它的 health 地址后，
+  # 会为每个 agent 派生出各自的 ws 接入地址（token = AES(key, agentId)）。
+  # 我们的方案要靠它把仓管系统的出入库工具接进来，所以默认部署。
+  # 部署说明见 docs/mcp-endpoint-enable.md。
+  xiaozhi-esp32-server-mcp-endpoint:
+    image: ghcr.nju.edu.cn/xinnan-tech/mcp-endpoint-server:latest
+    container_name: xiaozhi-esp32-server-mcp-endpoint
+    restart: always
+    ports:
+      # 注意：填进智控台的地址必须用宿主机的局域网 IP，
+      # 不能用容器内网 IP（日志里打印的那个），外部服务连不上。
+      - "8004:8004"
+    networks:
+      - default
 networks:
   default:

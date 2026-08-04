@@ -169,6 +169,20 @@ class ModelProbeControllerTest {
     }
 
     @Test
+    @DisplayName("防护2：Tailscale/CGNAT 段（100.64/10）放行，公网仍拒绝")
+    void acceptsTailscaleSharedAddressSpace() {
+        // 边缘设备常常只能通过 Tailscale 触达，实测 orin-nx = 100.82.225.102。
+        // 100.64.0.0/10 是 RFC 6598 保留段，公网不可路由，放行不等于开放公网。
+        assertTrue(ModelProbeController.isAllowedPrivateAddress(literal("100.82.225.102")));
+        assertTrue(ModelProbeController.isAllowedPrivateAddress(literal("100.64.0.0")));
+        assertTrue(ModelProbeController.isAllowedPrivateAddress(literal("100.127.255.255")));
+        // 边界外仍是公网
+        assertFalse(ModelProbeController.isAllowedPrivateAddress(literal("100.63.255.255")));
+        assertFalse(ModelProbeController.isAllowedPrivateAddress(literal("100.128.0.0")));
+        assertNotNull(ModelProbeController.parseAndValidateEndpoint("100.82.225.102:8621"));
+    }
+
+    @Test
     @DisplayName("防护2：云元数据端点即使落在链路本地段也必须拒绝")
     void rejectsCloudMetadataAddresses() {
         // 这几个地址都在 169.254/16 / fc00::/7 里，不单独拉黑就会被放行，
