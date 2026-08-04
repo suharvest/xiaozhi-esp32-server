@@ -315,3 +315,82 @@ GET /api/health/providers
 | S6 | `GET /api/health/providers` | S4 |
 
 S1~S3 是纯增量、风险低，先做。S4~S6 动到连接生命周期，要配合真机验证。
+
+---
+---
+
+# 第三部分：配置校验 —— 让「配错了」当场可见
+
+## 15. 现状：唯一的校验只检查中文「你」
+
+`VLLMProvider.__init__`（`core/providers/vllm/openai.py:37`）里唯一的检查是
+`check_model_key("VLLM", self.api_key)`，而它的全部实现是（`core/utils/util.py:133-136`）：
+
+```python
+def check_model_key(modelType, modelKey):
+    if "你" in modelKey:
+        return f"配置错误: {modelType} 的 API key 未设置,当前值为: {modelKey}"
+    return None
+```
+
+只为识别占位符 `你的api_key`。填 `abc` 通过、填空串通过、填过期的真 key 通过、
+`base_url` 指向不存在的地址也通过。而 `openai.OpenAI(...)` 构造不发任何请求
+—— **provider 实例化成功 ≠ 能用**。
+
+ASR/TTS/LLM/VLLM 四个 provider 是同一个模式：构造不阻塞、失败只 WARN。
+**全系统没有任何一处会主动说「这个配置是错的」。**
+
+## 16. 每类 provider 的「强校验」定义
+
+弱校验（只探能力端点 / `/v1/models`）一律不接受 —— 它给的是**假阳性**，
+而假阳性的代价是客户在现场付的。每类都必须做一次真实往返：
+
+| 类型 | 强校验动作 | 为什么弱校验不够 |
+|---|---|---|
+| **LLM** | `POST /v1/chat/completions`，`max_tokens: 1` | `edge-llm-chat-service/DOCKERFILE_PLAN.md:28` 自述：`/v1/models` 发现不了 MHA kernel/runtime 崩溃 |
+| **VLLM** | 发一张几十字节的纯色小图 + 「描述这张图」，`max_tokens: 1` | 很多 OpenAI 兼容端点**接受 `image_url` 字段但底层模型没有视觉能力**，只查 `/v1/models` 必得假阳性 |
+| **TTS** | 合成一段极短文本，确认真出 PCM | `/tts/capabilities` 说 ready 只代表 backend 装载了，不代表能出音 |
+| **ASR** | 能力端点 + WS 握手（不必发音频） | 鉴权失败是 accept 后 close 4401，HTTP 层探不出来 |
+| **声纹** | `POST /speaker/embedding` 传一小段静音 PCM | 模型未装时该端点返 503，只有真调才知道 |
+
+代价是每次校验一次真实推理（云端几分钱，本地几百毫秒）。值得。
+
+## 17. 交互：保存即校验，失败不阻断
+
+不要做成「有个测试按钮，等你想起来点」—— 没人会点。
+
+```
+[保存] ──► 后台跑一次强校验
+            ├─ 通过：正常保存，列表里显示 ✅
+            └─ 失败：**仍然保存**，但列表该行标 ⚠️，
+                     悬停显示具体原因（401 / 连不上 / 模型不支持视觉 / 503 未就绪）
+```
+
+**失败不阻断保存**是刻意的：客户常常先填配置、服务还没起来，硬拦会让人抓狂。
+但 ⚠️ 会一直挂着直到校验通过，于是「哪个配置是坏的」变成一眼可见，
+而不是等设备不响应了再回头猜。
+
+数据来源与 §13 的 `GET /api/health/providers` 是同一份：
+智控台读它渲染 ⚠️，现场 curl 它排查。校验结果带时间戳，避免把一次陈旧的失败
+一直显示成当前状态。
+
+## 18. 待定：不用视觉时应否停止广播 vision 能力
+
+`send_mcp_initialize_message`（`core/providers/tools/device_mcp/mcp_handler.py:251-274`）
+**无条件**把 vision 能力下发给设备：
+
+```python
+vision_url = get_vision_url(conn.config)   # 全程不检查 VLLM 是否配置
+...
+"capabilities": {..., "vision": vision}
+```
+
+后果：未配 VLLM 时能力照样广播 → 设备注册摄像头工具 → LLM 看得见就会调 →
+拍照 → `POST /mcp/vision/explain` → `vision_handler.py:114` 抛
+「您还未设置默认的视觉分析模块」。**故障点在最后一公里**，前面每一步都以为自己是对的。
+
+建议：`selected_module.VLLM` 为空时不下发 `vision` 能力（几行）。方向上与仓管系统
+那条「透明 gate」教训一致 —— **不该有的能力就别暴露给 LLM，否则它一定会去用**。
+
+⏳ 等确认本方案是否需要视觉问答后再实施。人脸链路不走 VLLM（仓管后端直连设备
+拉图/拉身份），若只做刷脸出入库，视觉能力可直接关闭。
