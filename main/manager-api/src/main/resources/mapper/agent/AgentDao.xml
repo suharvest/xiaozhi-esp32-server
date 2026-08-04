@@ -18,7 +18,7 @@
         <result column="vllmModelId" property="vllmModelId"/>
         <result column="ttsModelId" property="ttsModelId"/>
         <result column="ttsVoiceId" property="ttsVoiceId"/>
-        <result column="tts_speaker_id" property="ttsSpeakerId"/>
+        <result column="ttsSpeakerId" property="ttsSpeakerId"/>
         <result column="ttsLanguage" property="ttsLanguage"/>
         <result column="ttsVolume" property="ttsVolume"/>
         <result column="ttsRate" property="ttsRate"/>
