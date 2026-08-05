@@ -199,3 +199,81 @@ agent 不存在，地址就不存在，无法在部署时预先串好。
 - [ ] 音色下拉能从真实设备拉到音色
 - [ ] 每个 agent 能生成各自的 MCP 接入点地址
 - [ ] 真实对话跑通（ASR → LLM → TTS 全链路）
+
+
+---
+---
+
+# 第五部分：合并部署（仓管 + 人脸 + 智控台一份 compose）
+
+## 19. 为什么该合并
+
+两个套餐里**仓管系统和语音服务本来就部署在同一台设备上**（套餐三都在 R2135-12，
+二B 都在 J4012），却被拆成两个部署步骤、两个 compose project
+（`mcp_warehouse` / `xiaozhi_voice`）。
+
+合并的收益不只是少一步：
+- 两个服务进同一个 docker 网络，**仓管可以用服务名直连 xiaozhi**，不必绕宿主 IP
+- 部署失败时只有一个 project 要排查
+- 人脸识别服务本来就已经和仓管在同一份 compose 里，合并后三者统一
+
+代价：project 名变化，已交付的客户升级时要处理。现在尚未交付，正是合并的时机。
+
+## 20. 加速器差异：用 compose profiles，不用覆盖文件
+
+人脸识别按硬件分两个变体，差别是**镜像 tag + 硬件访问方式**：
+
+| | 树莓派 / Hailo | Jetson |
+|---|---|---|
+| 镜像 | `face-rec-api:v1.1-hailo` | `face-rec-api:v1.1-jetson` |
+| 硬件 | `devices:` 映射 | `runtime: nvidia` |
+
+`devices:` 与 `runtime:` 是**结构性差异，变量替换解决不了**。
+
+**覆盖文件（`-f a.yml -f b.yml`）这条路走不通** —— `compose_file` 在 schema
+（`spec/device.schema.json` 的 `DockerConfig` / `DockerRemoteConfig`）和引擎里
+都是单个 string。
+
+**改用 compose profiles**（引擎已支持，`docker_remote_deployer.py:651-656`）：
+
+```yaml
+face-rec-hailo:
+  profiles: ["hailo"]
+  image: .../face-rec-api:v1.1-hailo
+  devices: [...]
+face-rec-jetson:
+  profiles: ["jetson"]
+  image: .../face-rec-api:v1.1-jetson
+  runtime: nvidia
+```
+
+选 hailo 只起 hailo 的，选 jetson 只起 jetson 的，**都不选则一个都不起**
+（天然实现「不启用人脸识别」）。
+
+## 21. 让 profile 跟着用户选项走
+
+`options.compose_profiles` 是**静态值**，不支持模板替换。而我们需要它跟着用户选的
+`face_accelerator` 变。
+
+解法：走 `docker.environment` 的 `COMPOSE_PROFILES`。该字段**支持模板替换**且被注入
+到**命令执行环境**而非容器（`docker_remote_deployer.py:1038-1051`，源码注释原文：
+「compose substitutes ${VAR} from env」）：
+
+```yaml
+docker:
+  environment:
+    COMPOSE_PROFILES: "{{face_accelerator}}"
+```
+
+### ⚠️ 坑：pull 阶段拿不到 env
+
+```python
+:1051  up   →  cd ... && {env_prefix}{compose_command} ... up -d      # 有 env
+:867   pull →  cd ... && {compose_command} {profile_args} pull ...    # 没有 env_prefix
+```
+
+`pull` 只认静态的 `profile_args`，读不到 `COMPOSE_PROFILES`。后果：带 profile 的
+人脸镜像**不会在 pull 阶段预拉**，要等 `up -d` 时现拉。表现为「进度条走完了却卡在
+最后一步」，人脸镜像 600MB，在树莓派上可能等好几分钟。
+
+→ 规避：在 `actions.before` 里按所选加速器显式 `docker pull` 一次，顺带给用户进度反馈。
