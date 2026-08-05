@@ -10,12 +10,12 @@
 │  Jetson Orin NX              │        │  Raspberry Pi 5 + Hailo-8          │
 │                              │        │                                    │
 │  OpenVoiceStream  :8621      │◄───────┤  xiaozhi-server        :18000 (ws) │
-│    ASR  (Qwen3)              │  局域网 │  智控台 manager-api    :18002      │
+│    ASR  (Qwen3/TensorRT)     │  局域网 │  智控台 manager-api    :18002      │
 │    TTS  (Matcha)             │  /VPN  │  xiaozhi-server HTTP   :18003      │
 │    声纹 embedding            │        │  MCP 接入点            :18004      │
 │                              │        │                                    │
 │  EdgeLLM          :8000      │◄───────┤  仓库管理系统          :2125       │
-│    Qwen3.5                   │        │  人脸识别 (Hailo)      :8001       │
+│    Qwen3.5-4B                │        │  人脸识别 (Hailo)      :8001       │
 └──────────────────────────────┘        └────────────────────────────────────┘
                                                       ▲
                                                       │ WebSocket
@@ -37,8 +37,8 @@
 |---|---|---|
 | [`suharvest/xiaozhi-esp32-server`](https://github.com/suharvest/xiaozhi-esp32-server) | 语音服务端 + 智控台 | 本仓库。上游是 `xinnan-tech/xiaozhi-esp32-server`，本 fork 增加了 OpenVoiceStream / EdgeLLM 供应商、地址自动探测、仓库助手角色模板等 |
 | `warehouse_system` | 仓库管理系统 + MCP server | 提供出入库/库存/看板，并以 MCP 工具形式暴露给语音助手 |
-| `seeed-local-voice`（OpenVoiceStream） | 本地语音栈 | ASR + TTS + 声纹，**同一进程同一端口** |
-| `edge-llm-chat-service`（EdgeLLM） | 本地大模型 | OpenAI 兼容接口 |
+| [`suharvest/openvoicestream`](https://github.com/suharvest/openvoicestream) | 本地语音栈（OVS） | ASR + TTS + 声纹，**同一进程同一端口**。自带安装器 |
+| EdgeLLM | 本地大模型 | OpenAI 兼容接口，独立服务 |
 
 ### 镜像
 
@@ -89,6 +89,50 @@ curl -s http://<ORIN_IP>:8000/v1/models | head -c 200
 
 `/readyz` 返回 200 才继续。**注意**：OpenVoiceStream 在 `LAZY_TTS=1` 时 TTS 是懒加载的，
 刚启动那几十秒能力端点会返 503，属正常，等一会儿再试。
+
+---
+
+## 1.5 Orin NX：语音栈
+
+OVS 自带安装器，会自动识别机型并选择合适的 profile：
+
+```bash
+git clone https://github.com/suharvest/openvoicestream
+cd openvoicestream
+deploy/install.sh --target orin-nx --pull --verify
+```
+
+`--target orin-nx` 对应 v0.9.1 ASR（Qwen3 / TensorRT）+ Matcha TTS，profile 为
+`jetson-edgellm-v091-matcha`。`--verify` 会在装完后自跑一次校验。
+
+装完只有**一个容器**，宿主端口 **8621**（容器内 8000），ASR / TTS / 声纹都在它上面。
+
+```bash
+curl -s http://localhost:8621/readyz
+curl -s http://localhost:8621/asr/capabilities
+curl -s http://localhost:8621/tts/speakers | head -c 300
+```
+
+首次启动要下载模型权重，视网络可能需要较久；`OVS_AUTO_DOWNLOAD_ARTIFACTS=1` 会自动拉取，
+默认走 `hf-mirror.com` 镜像。
+
+> **TTS 是懒加载的**（`LAZY_TTS=1`）。刚启动时 `/tts/*` 会返 503，属正常，等模型加载完即可。
+> 智控台的自动探测已经考虑了这一点（会轮询重试），但如果你手工 curl 撞上 503，等一会儿再试。
+
+### EdgeLLM
+
+对话大模型是**独立服务**，OpenAI 兼容接口，监听 **:8000**。部署方式见其自身文档。
+本方案实测运行的是 `Qwen/Qwen3.5-4B`。验证：
+
+```bash
+curl -s http://localhost:8000/v1/models
+curl -s http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3.5-4B","messages":[{"role":"user","content":"hi"}],"max_tokens":1}'
+```
+
+> 只查 `/v1/models` 不足以判断可用 —— 它查的是元数据，发现不了推理运行时的崩溃。
+> **必须打一次真实的 `/v1/chat/completions`**，返回 200 且有 `choices` 才算就绪。
 
 ---
 
