@@ -4,7 +4,10 @@ version: '3'
 services:
   # manager-api和manager-web模块
   xiaozhi-esp32-server-web:
-    image: ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:web_latest
+    # 我们自建的镜像：含 OVS/EdgeLLM 供应商、仓库助手角色模板、/models/probe 探测端点
+    # 等全部 changeset。上游 web_latest 一个都没有，别换回去。
+    # 构建：docker build -f Dockerfile-web -t seeed/xiaozhi-manager:arm64 .
+    image: seeed/xiaozhi-manager:arm64
     container_name: xiaozhi-esp32-server-web
     restart: always
     networks:
