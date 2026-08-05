@@ -42,7 +42,8 @@
 
 ### 镜像
 
-均在 `sensecraft-missionpack.seeed.cn`，需先 `docker login`。
+均在 `sensecraft-missionpack.seeed.cn`。**该 registry 允许匿名拉取，不需要 `docker login`**
+（已在无凭据设备上实测确认）。直接 `docker compose pull` 即可。
 
 | 镜像 | 跑在 | 用途 |
 |---|---|---|
