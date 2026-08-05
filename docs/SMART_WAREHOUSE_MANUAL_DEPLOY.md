@@ -292,6 +292,25 @@ docker restart xiaozhi-server
 > 已经改成 Orin NX 的地址，服务端用的仍是旧值，而且**不会报任何错** —— 表现为语音
 > 完全没反应但日志干净。
 
+### 3.8 确认服务端真的起来了
+
+到这一步 secret 才刚回填，**这是 `xiaozhi-server` 第一次具备正常启动的条件** ——
+在此之前它一直在崩（`无效的服务器密钥`），这是正常的，不用管。现在才需要确认它起来：
+
+```bash
+for i in $(seq 20); do
+  docker exec xiaozhi-server python3 -c \
+    "import urllib.request;print(urllib.request.urlopen('http://localhost:8003/voiceprint/health',timeout=3).status)" \
+    2>/dev/null | grep -q 200 && { echo "已就绪"; break; }
+  sleep 3
+done
+docker inspect --format '{{.State.Health.Status}}' xiaozhi-server
+```
+
+> **不要用 `/xiaozhi/ota/` 做探测** —— 智控台模式下 `xiaozhi-server` 不注册该路由，
+> 永远 404。这一点坑过我们两次：一次是数据库里的 `server.ota` 写错端口，一次是
+> compose 健康检查探了这个路由导致容器永远 `unhealthy`。
+
 ---
 
 ## 4. 智控台里的配置
@@ -400,5 +419,5 @@ docker compose -p mcp_warehouse ps
 | §3.1 目录结构 | 文件上传阶段 |
 | §3.2 占位符替换 | `actions.before` |
 | §3.3 启动 | compose pull / up 阶段 |
-| §3.4 ~ §3.7 | `actions.after` |
+| §3.4 ~ §3.8 | `actions.after` |
 | §4 之后 | 引导页的手工步骤 |
