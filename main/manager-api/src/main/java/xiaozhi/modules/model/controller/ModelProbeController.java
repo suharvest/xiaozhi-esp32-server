@@ -496,7 +496,7 @@ public class ModelProbeController {
             }
             // 100.64.0.0/10 —— RFC 6598 Shared Address Space（运营商级 NAT 保留段）。
             // Tailscale 的 overlay 网络就用这一段，而边缘设备（Jetson / RK / RPi）
-            // 常常只能通过 Tailscale 触达 —— 实测 orin-nx 就是 100.82.225.102。
+            // 常常只能通过 Tailscale 触达，其地址就落在这个段里。
             // 放行它不等于开放公网：这段地址由 IANA 保留、公网不可路由。
             return b0 == 100 && b1 >= 64 && b1 <= 127;
         }

@@ -183,7 +183,7 @@ LLM 服务  [ 192.168.1.50:8000 ]  [检测]
    changelog」且确实不在 `db.changelog-master.yaml` 里 → 客户装完，智控台里根本
    看不到 OVS/EdgeLLM 供应商，要人工进数据库执行。
 4. **去掉硬编码的开发机地址。** `seeed-providers.sql:29,32,35` 三处写着
-   `http://100.82.225.102:8621`（Tailscale 地址）。
+   `http://<设备IP>:8621`（Tailscale 段内地址）。
 5. **provider fields 补 `speaker_id`。** 目前只暴露了 `sid`，`speaker_id` 只能靠
    agent 的 `tts_speaker_id` 注入，配置面上缺一块。
 
