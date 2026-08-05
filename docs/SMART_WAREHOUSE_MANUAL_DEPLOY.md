@@ -189,9 +189,17 @@ cd ~/xiaozhi_voice/assets/docker
 # 放入 configs/config-console.yaml
 ```
 
-> ⚠️ **compose 里的相对挂载路径是相对于 compose 文件所在目录解析的**，不是你执行
-> `docker compose` 的目录。务必保持上面的目录结构，否则挂载会落在错误位置 ——
-> 这是真机部署踩过的坑。
+> ⚠️ **这一步必须在 `up -d` 之前做完，两个原因：**
+>
+> 1. **相对挂载按 compose 文件所在目录解析**，不是你执行 `docker compose` 的目录。
+>    目录结构不对，挂载就落在错误位置。
+> 2. **`data/` 必须先由你建出来。** 如果先跑了 `up -d`，Docker daemon（root）会替你
+>    把这个挂载点建出来，属主是 `root:root`，之后普通用户往里写 `.config.yaml` 会
+>    `Permission denied`，而容器报的是「找不到 data/.config.yaml」——
+>    症状和权限问题对不上，很难查。
+>
+> 已经踩到了的话：`docker compose -p xiaozhi_voice down`，
+> `sudo rm -rf data && mkdir -p data`，再重新 `up -d`。
 
 ### 3.2 生成 `data/.config.yaml`
 
@@ -376,9 +384,14 @@ ESP32（小智）与 Himax（视觉）固件的烧录方式见上游文档。烧
 
 ## 6. 部署后验证清单
 
-按顺序逐条过，任何一条不过就别往下走：
+分两批：**§6.1 在做完 §3 之后跑，§6.2 必须等 §4 填完模型地址才跑。**
+搞反了会得到错误结论 —— 见 §6.2 的说明。
+
+### 6.1 基础设施（§3 之后）
 
 ```bash
+cd ~/xiaozhi_voice/assets/docker      # 与 §3.1 建的目录一致
+
 # 1. 五个容器都在，且 xiaozhi-server 不在反复重启
 docker compose -p xiaozhi_voice ps
 docker inspect --format '{{.RestartCount}}' xiaozhi-server        # 应为 0
@@ -390,18 +403,27 @@ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:18002/xiaozhi/user/pub
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:18002/xiaozhi/ota/
 
 # 4. secret 已回填（不该是占位符）
-grep '^  secret:' ~/xiaozhi_voice/assets/docker/data/.config.yaml
+grep '^  secret:' data/.config.yaml
 
-# 5. 服务端确实连上了 Orin NX 的语音栈
-docker logs xiaozhi-server 2>&1 | grep -iE 'OVS|ASR|TTS' | tail -20
-
-# 6. 仓库系统与人脸识别
+# 5. 仓库系统与人脸识别
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:2125
 docker compose -p mcp_warehouse ps
 ```
 
-第 5 条应该能看到类似 `OVS ASR capabilities: backend=... capabilities=['streaming',...]`。
-**日志里出现 `127.0.0.1:8621` 说明 §3.7 的缓存没清干净。**
+### 6.2 语音链路（**必须在 §4.1 之后**）
+
+```bash
+docker logs xiaozhi-server 2>&1 | grep -iE 'OVS|ASR|TTS' | tail -20
+```
+
+应该看到 `OVS ASR capabilities: backend=... capabilities=['streaming',...]`。
+
+> ⚠️ **在 §4.1 之前跑这条，一定会看到 `Cannot connect to host 127.0.0.1:8621`，这是正常的。**
+> §3 和配置脚本**从头到尾都没有写过模型地址** —— 它们只写设备接入地址和 MCP 接入点。
+> 模型地址是 §4.1 在智控台网页里填的，在那之前数据库里就是种子默认值 `127.0.0.1`。
+>
+> 所以：**做完 §4.1 之后仍然出现 `127.0.0.1:8621`**，才说明 §3.7 的缓存没清干净，
+> 那时候重跑一次 §3.7 才有意义。在 §4.1 之前反复重跑脚本不会有任何改变。
 
 ---
 
