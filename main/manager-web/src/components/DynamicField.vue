@@ -76,6 +76,7 @@
           @change="(val) => $emit('input', val)"
           @focus="$emit('focus')"
           @blur="$emit('blur')"
+          @visible-change="handleVisibleChange"
         >
           <el-option
             v-for="opt in mergedRemoteOptions"
@@ -188,7 +189,7 @@ export default {
       if (this.loading) return '';
       if (this.remoteOptions && this.remoteOptions.length) return '';
       const dep = this.field.optionsFrom && this.field.optionsFrom.dependsOn;
-      return dep ? `填好「${dep}」后点右侧按钮拉取` : '';
+      return dep ? `填好「${dep}」后展开即可自动拉取` : '';
     },
     numberValue() {
       if (this.value === '' || this.value === null || this.value === undefined) return undefined;
@@ -213,6 +214,29 @@ export default {
       if (!v || typeof v !== 'string') return '';
       if (/^(https?|wss?):\/\/.+/i.test(v.trim())) return '';
       return '格式示例：http://192.168.1.50:8621';
+    },
+  },
+  methods: {
+    /**
+     * 展开下拉时若还没有选项，自动拉一次。
+     *
+     * 不这么做的话，用户点开下拉看到「无数据」，第一反应是功能坏了 —— 尽管
+     * 旁边有「填好地址后点右侧按钮拉取」的提示，但没人会先读提示再点。
+     * 实测走查时我自己也是先点下拉、看到空、才回头找刷新按钮的。
+     *
+     * 只在「选项为空 + 依赖字段已填 + 当前没在加载」时触发：
+     * 已有选项就别重复打设备；依赖字段没填时拉了也必然失败，徒增一次报错。
+     * 想强制刷新（比如换了设备地址）仍可点右侧按钮。
+     */
+    handleVisibleChange(visible) {
+      if (!visible) return;
+      if (this.loading) return;
+      if (this.remoteOptions && this.remoteOptions.length) return;
+      const from = this.field.optionsFrom;
+      if (!from) return;
+      const dep = from.dependsOn;
+      if (dep && !(this.configJson || {})[dep]) return;
+      this.$emit('probe', from);
     },
   },
 };
