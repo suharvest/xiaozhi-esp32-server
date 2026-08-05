@@ -38,7 +38,7 @@
 | [`suharvest/xiaozhi-esp32-server`](https://github.com/suharvest/xiaozhi-esp32-server) | 语音服务端 + 智控台 | 本仓库。上游是 `xinnan-tech/xiaozhi-esp32-server`，本 fork 增加了 OpenVoiceStream / EdgeLLM 供应商、地址自动探测、仓库助手角色模板等 |
 | `warehouse_system` | 仓库管理系统 + MCP server | 提供出入库/库存/看板，并以 MCP 工具形式暴露给语音助手 |
 | [`suharvest/openvoicestream`](https://github.com/suharvest/openvoicestream) | 本地语音栈（OVS） | ASR + TTS + 声纹，**同一进程同一端口**。自带安装器 |
-| EdgeLLM | 本地大模型 | OpenAI 兼容接口，独立服务 |
+| EdgeLLM | 本地大模型 | Qwen3.5-4B，OpenAI 兼容接口。**compose 也在 openvoicestream 仓库里**，由同一个安装器部署 |
 
 ### 镜像
 
@@ -102,10 +102,21 @@ cd openvoicestream
 deploy/install.sh --target orin-nx --pull --verify
 ```
 
-`--target orin-nx` 对应 v0.9.1 ASR（Qwen3 / TensorRT）+ Matcha TTS，profile 为
-`jetson-edgellm-v091-matcha`。`--verify` 会在装完后自跑一次校验。
+`--target orin-nx` **一条命令同时装语音栈和大模型**，对应仓库里这两份 compose：
 
-装完只有**一个容器**，宿主端口 **8621**（容器内 8000），ASR / TTS / 声纹都在它上面。
+| compose | 服务 | 端口 | 内容 |
+|---|---|---|---|
+| `deploy/docker-compose.edgellm-v091-voice.yml` | `speech` | 8621 | ASR（Qwen3/TensorRT）+ Matcha TTS + 声纹 |
+| `deploy/docker-compose.edgellm-v091-cutover.yml` | `edge-llm` | 8000 | EdgeLLM，Qwen3.5-4B |
+
+OVS profile 为 `jetson-edgellm-v091-matcha`；`--verify` 会在装完后自跑一次校验。
+大模型引擎有 **4k / 8k** 两档上下文，用 `EDGELLM_ENGINE_PROFILE` 选，默认 8k：
+
+```bash
+EDGELLM_ENGINE_PROFILE=4k deploy/install.sh --target orin-nx --pull --verify
+```
+
+装完是**两个容器**。ASR / TTS / 声纹都在 `speech` 上（同一进程同一端口 8621）。
 
 ```bash
 curl -s http://localhost:8621/readyz
@@ -121,8 +132,8 @@ curl -s http://localhost:8621/tts/speakers | head -c 300
 
 ### EdgeLLM
 
-对话大模型是**独立服务**，OpenAI 兼容接口，监听 **:8000**。部署方式见其自身文档。
-本方案实测运行的是 `Qwen/Qwen3.5-4B`。验证：
+上一条命令已经把它装好了（`edge-llm` 容器，OpenAI 兼容接口，监听 **:8000**，
+运行 `Qwen/Qwen3.5-4B`）。验证：
 
 ```bash
 curl -s http://localhost:8000/v1/models
