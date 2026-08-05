@@ -75,7 +75,7 @@
 
 - NVIDIA Container Runtime 可用
 - 可用磁盘 ≥ 15 GB（模型权重占大头）
-- OpenVoiceStream 与 EdgeLLM 已部署并可访问（部署方式见各自仓库文档）
+- OpenVoiceStream 与 EdgeLLM 已部署并可访问（部署见 §1.5）
 
 ### 网络
 
