@@ -62,6 +62,10 @@ class ASRProvider(ASRProviderBase):
         self.is_processing = False
         self.last_partial = ""
         self._final_event: Optional[asyncio.Event] = None
+        # 引擎自行断句后已确认的文本。OVS 的 VAD 一旦在句中触发（说话有停顿就会），
+        # 它会结算当前段并**在自己那边开新的一段**；后续 EOF 只结算新段。不累加的话
+        # 之前所有段的文本都会丢掉，只剩最后一小段。
+        self._committed_text = ""
         # Becomes True once we explicitly send end_utterance — only after that
         # do we honour a final from the backend (unless allow_backend_endpoint).
         self._stop_sent = False
@@ -162,6 +166,7 @@ class ASRProvider(ASRProviderBase):
         self._stop_sent = False
         self._pre_roll_done = False
         self._final_event = asyncio.Event()
+        self._committed_text = ""
         self.receiver_task = asyncio.create_task(self._receive_loop(conn))
 
         # Pre-roll: replay the last few cached frames so we don't clip the
@@ -213,6 +218,7 @@ class ASRProvider(ASRProviderBase):
                 self.asr_ws = None
         self._final_event = None
         self._stop_sent = False
+        self._committed_text = ""
 
     # ------------------------------------------------------------------
     # Receive loop
@@ -258,9 +264,18 @@ class ASRProvider(ASRProviderBase):
                             self.last_partial = text
                         continue
                     if not self._stop_sent and not self.allow_backend_endpoint:
-                        # Backend self-endpointed; treat as a stable partial.
+                        # 引擎自己断句了。我们不把它当作「这轮说完了」（那会腰斩
+                        # 用户还没说完的话），但**必须把这一段的文本收下来** ——
+                        # 引擎已经在它那边翻篇了，后续 EOF 只会结算新的一段。
+                        #
+                        # 早先这里写的是 `self.last_partial = text`（覆盖），于是
+                        # 用户说话中间一停顿超过 vad_silence_ms，前面所有内容就被
+                        # 静默丢弃，最终只拿到最后一小段。实测：4.32s 音频完整送达
+                        # （实发字节与缓冲逐字节相等），却只识别出「嗯。」；把同一份
+                        # 字节离线整段转写则是「帮我查一下 SKU002 的库存。」。
                         if text:
-                            self.last_partial = text
+                            self._commit_segment(text)
+                            self.last_partial = ""
                         continue
                     # Either we triggered this via _send_stop_request, OR the
                     # backend detected its own endpoint (only when
@@ -269,11 +284,11 @@ class ASRProvider(ASRProviderBase):
                     if self._handling_voice_stop and not self._stop_sent:
                         # Another path already scheduled handle_voice_stop;
                         # just signal the final and exit.
-                        self.text = text or self.last_partial
+                        self.text = self._join_committed(text or self.last_partial)
                         if self._final_event is not None:
                             self._final_event.set()
                         break
-                    self.text = text or self.last_partial
+                    self.text = self._join_committed(text or self.last_partial)
                     if self._final_event is not None:
                         self._final_event.set()
                     if not self._stop_sent and self.allow_backend_endpoint:
@@ -360,6 +375,31 @@ class ASRProvider(ASRProviderBase):
             asr_audio_snapshot = list(conn.asr_audio)
             await self.handle_voice_stop(conn, asr_audio_snapshot)
             return
+
+    def _commit_segment(self, text: str) -> None:
+        """收下引擎自行断句产出的一段文本。"""
+        text = (text or "").strip()
+        if not text:
+            return
+        self._committed_text = self._concat(self._committed_text, text)
+
+    @staticmethod
+    def _concat(left: str, right: str) -> str:
+        """拼接两段识别文本。
+
+        中文之间不加空格（加了 TTS 会读出停顿、字幕也难看），拉丁字母相邻时补一个
+        空格，否则 "SKU" + "0002" 会粘成 "SKU0002" 影响后续匹配。
+        """
+        if not left:
+            return right
+        if not right:
+            return left
+        need_space = left[-1].isascii() and left[-1].isalnum() and \
+            right[0].isascii() and right[0].isalnum()
+        return left + (" " if need_space else "") + right
+
+    def _join_committed(self, tail: str) -> str:
+        return self._concat(self._committed_text, (tail or "").strip())
 
     async def _send_stop_request(self):
         """Tell backend the utterance is over so it produces a final.
