@@ -1313,6 +1313,39 @@ class ConnectionHandler:
                     self.dialogue.put(Message(role="assistant", content=streamed_text))
                 response_message.clear()
 
+                # 工具调用期间先播一句填充语，否则设备会一直收不到音频。
+                #
+                # 走标准 function call 时模型只返回 tool_calls、不带 content，
+                # 所以上面的 streamed_text 是空的 —— 从 ASR 收尾到最终答案播出来
+                # 中间有 5~7 秒（第一轮推理 + 工具往返 + 第二轮推理）设备侧完全
+                # 静默，实测设备会在第 8~9 秒主动断连，答案刚好赶不上。服务端的
+                # close_connection_no_voice_time 是 120 秒，拦不住这种断连。
+                #
+                # 角色提示词里「查询时只说『正在查询』」本就是这个意图，但模型没有
+                # 地方放这句话（tool_calls 那一轮不产出文本），只能由服务端补。
+                #
+                # 不写入 dialogue：这是交互上的等待提示，不该进模型上下文，否则会
+                # 被当成助手真的说过的话，干扰后续轮次。
+                # 不调 store_tts_text：那个 map 按 sentence_id 覆盖，存了会把真正
+                # 答案的字幕挤掉。
+                # 句号是必需的，不是排版。TTS 的首句分句器（providers/tts/base.py:96
+                # first_sentence_punctuations 与 :111 first_sentence_max_chars=5）
+                # 要么命中标点、要么超过 5 个字才会立即合成；「正在查询」四个字又不带
+                # 标点，两个条件都不满足，会被当成半句一直缓存，直到第二轮 LLM 的文本
+                # 到达才凑够一句 —— 实测填充语延后到 8 秒后才出声，而且和模型回答粘成
+                # 了一句「正在查询不确定」。带上句号才会立刻送去合成。
+                filler = self.config.get("tool_call_filler", "正在查询。")
+                if depth == 0 and not streamed_text and filler:
+                    self.logger.bind(tag=TAG).debug(f"工具调用填充语: {filler}")
+                    self.tts.tts_text_queue.put(
+                        TTSMessageDTO(
+                            sentence_id=current_sentence_id,
+                            sentence_type=SentenceType.MIDDLE,
+                            content_type=ContentType.TEXT,
+                            content_detail=filler,
+                        )
+                    )
+
                 # 收集所有工具调用的 Future
                 futures_with_data = []
                 for tool_call_data in tool_calls_list:
