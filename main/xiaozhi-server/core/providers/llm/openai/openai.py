@@ -21,6 +21,18 @@ THINKING_DISABLED_DOMAINS = {
 class LLMProvider(LLMProviderBase):
     def __init__(self, config):
         self.model_name = config.get("model_name")
+        # Some OpenAI-compatible servers render the chat prompt with a Jinja
+        # template that calls `.items()` on `tool_calls[].function.arguments`,
+        # i.e. they expect a mapping. The OpenAI spec says that field is a
+        # **JSON string**, so a spec-compliant client gets HTTP 500
+        # `tools_render_failed: Can only get item pairs from a mapping` the
+        # moment any tool-call history is present — which for this server is
+        # every request, because few-shot tool examples are always injected.
+        # Off by default: converting unconditionally would break the servers
+        # that correctly expect a string.
+        self.tool_arguments_as_object = bool(
+            config.get("tool_arguments_as_object", False)
+        )
         self.api_key = config.get("api_key")
         if "base_url" in config:
             self.base_url = config.get("base_url")
@@ -78,6 +90,44 @@ class LLMProvider(LLMProviderBase):
                 msg["content"] = ""
         return dialogue
 
+    def _adapt_tool_arguments(self, dialogue):
+        """Convert `tool_calls[].function.arguments` from JSON string to dict.
+
+        Only when `tool_arguments_as_object` is enabled. Copies the messages it
+        touches instead of mutating in place — `dialogue` is the connection's
+        live history, and rewriting it would make the change stick for every
+        later request (including ones to a different, spec-compliant provider).
+
+        A value that is not valid JSON is left exactly as it was: better to
+        send something the server may reject than to silently drop the
+        assistant's own tool call from the history.
+        """
+        if not self.tool_arguments_as_object:
+            return dialogue
+
+        import copy
+        import json as _json
+
+        out = []
+        for msg in dialogue:
+            calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+            if not calls:
+                out.append(msg)
+                continue
+            msg = copy.deepcopy(msg)
+            for call in msg.get("tool_calls") or []:
+                fn = call.get("function") if isinstance(call, dict) else None
+                if not isinstance(fn, dict):
+                    continue
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        fn["arguments"] = _json.loads(args)
+                    except Exception:
+                        pass
+            out.append(msg)
+        return out
+
     def _apply_thinking_disabled(self, request_params: dict):
         """根据域名自动禁用思考模式"""
         parsed_url = urlparse(self.base_url)
@@ -89,7 +139,7 @@ class LLMProvider(LLMProviderBase):
                 break
 
     def response(self, session_id, dialogue, **kwargs):
-        dialogue = self.normalize_dialogue(dialogue)
+        dialogue = self._adapt_tool_arguments(self.normalize_dialogue(dialogue))
 
         request_params = {
             "model": self.model_name,
@@ -135,7 +185,7 @@ class LLMProvider(LLMProviderBase):
             responses.close()
 
     def response_with_functions(self, session_id, dialogue, functions=None, **kwargs):
-        dialogue = self.normalize_dialogue(dialogue)
+        dialogue = self._adapt_tool_arguments(self.normalize_dialogue(dialogue))
 
         request_params = {
             "model": self.model_name,
