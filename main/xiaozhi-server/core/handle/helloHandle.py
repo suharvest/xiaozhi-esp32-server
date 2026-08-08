@@ -53,7 +53,11 @@ async def handleHelloMessage(conn: "ConnectionHandler", msg_json):
         conn.features = features
         if features.get("mcp"):
             conn.logger.bind(tag=TAG).debug("客户端支持MCP")
-            conn.mcp_client = MCPClient()
+            # Device tools are re-advertised on every LLM request, so a
+            # deployment can drop the ones its assistant can never use.
+            conn.mcp_client = MCPClient(
+                exclude_tools=_device_mcp_exclude_tools(conn)
+            )
             # 发送初始化
             asyncio.create_task(send_mcp_initialize_message(conn))
         if features.get("aec"):
@@ -157,3 +161,41 @@ async def wakeupWordsResponse(conn: "ConnectionHandler"):
         # 确保在任何情况下都释放锁
         if _wakeup_response_lock.locked():
             _wakeup_response_lock.release()
+
+
+def _device_mcp_exclude_tools(conn) -> list:
+    """Device tool names to hide from the LLM, newest source wins.
+
+    Three sources, checked in order:
+
+    1. ``DEVICE_MCP_EXCLUDE_TOOLS`` env var (comma-separated)
+    2. ``data/.device_mcp_exclude`` file, one name per line
+    3. ``device_mcp_exclude_tools`` in the config
+
+    The env var and the file exist because the config key does **not**
+    survive when ``read_config_from_api`` is on: the console's config
+    replaces the local dict wholesale, so a key added to ``.config.yaml``
+    silently disappears. That cost a debugging cycle — the exclusion looked
+    applied but all 29 tools were still advertised.
+    """
+    import os
+
+    raw = os.environ.get("DEVICE_MCP_EXCLUDE_TOOLS")
+    if raw:
+        return [x.strip() for x in raw.split(",") if x.strip()]
+
+    try:
+        path = os.path.join("data", ".device_mcp_exclude")
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                names = [
+                    line.strip()
+                    for line in f
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+            if names:
+                return names
+    except Exception:
+        pass
+
+    return (conn.config or {}).get("device_mcp_exclude_tools") or []

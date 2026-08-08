@@ -2,7 +2,6 @@ import json
 import asyncio
 import aiohttp
 import websockets
-import opuslib_next
 from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 from config.logger import setup_logging
 from core.providers.asr.base import ASRProviderBase
@@ -63,14 +62,25 @@ class ASRProvider(ASRProviderBase):
         self.is_processing = False
         self.last_partial = ""
         self._final_event: Optional[asyncio.Event] = None
+        # 引擎自行断句后已确认的文本。OVS 的 VAD 一旦在句中触发（说话有停顿就会），
+        # 它会结算当前段并**在自己那边开新的一段**；后续 EOF 只结算新段。不累加的话
+        # 之前所有段的文本都会丢掉，只剩最后一小段。
+        self._committed_text = ""
         # Becomes True once we explicitly send end_utterance — only after that
         # do we honour a final from the backend (unless allow_backend_endpoint).
         self._stop_sent = False
         self._handling_voice_stop = False  # mutex guarding handle_voice_stop entry
         self._pre_roll_done = False
+        # Reconnect backoff. Without it a single failure becomes a storm:
+        # the device feeds a 60 ms frame every 60 ms, each one retries the
+        # connection, and OVS (whose ASR executor runs max_workers=1) reports
+        # pool_saturated because the previous worker has not been released
+        # yet. Measured ~5 reconnects/second, which turned one dropped
+        # utterance into a permanently unusable session.
+        self._connect_fail_count = 0
+        self._next_connect_at = 0.0
         self._conn = None
 
-        self.decoder = opuslib_next.Decoder(16000, 1)
 
         # Fire-and-forget capabilities probe (non-blocking init).
         import threading
@@ -150,25 +160,45 @@ class ASRProvider(ASRProviderBase):
             close_timeout=5,
         )
         self.is_processing = True
+        self._connect_fail_count = 0
+        self._next_connect_at = 0.0
         self.last_partial = ""
         self._stop_sent = False
         self._pre_roll_done = False
         self._final_event = asyncio.Event()
+        self._committed_text = ""
         self.receiver_task = asyncio.create_task(self._receive_loop(conn))
 
-        # Pre-roll: replay last few cached opus packets as PCM so we don't
-        # clip the very start of the utterance.
+        # Pre-roll: replay the last few cached frames so we don't clip the
+        # very start of the utterance. conn.asr_audio holds **PCM** —
+        # connection.py:159 documents it as "存储PCM帧列表，供VAD和ASR共享"
+        # and the entry point decodes Opus once for everyone
+        # (connection.py:377 "入口处直接解码PCM，避免VAD和ASR重复解码").
         if conn.asr_audio:
-            for cached in conn.asr_audio[-10:]:
+            for cached_pcm in conn.asr_audio[-10:]:
                 try:
-                    pcm = self.decoder.decode(cached, 960)
-                    await self.asr_ws.send(pcm)
+                    await self.asr_ws.send(cached_pcm)
                 except Exception as e:
-                    logger.bind(tag=TAG).warning(
-                        f"Pre-roll decode/send failed: {e}"
-                    )
+                    logger.bind(tag=TAG).warning(f"Pre-roll send failed: {e}")
                     break
         self._pre_roll_done = True
+
+    def _note_connect_failure(self):
+        """Exponential backoff, capped at 5 s.
+
+        The cap matters as much as the growth: a user waiting on a device
+        should get another attempt within a few seconds, but OVS must get
+        enough quiet to release its single ASR worker. 0.5s, 1s, 2s, 4s, 5s…
+        """
+        import time as _t
+
+        self._connect_fail_count += 1
+        delay = min(0.5 * (2 ** (self._connect_fail_count - 1)), 5.0)
+        self._next_connect_at = _t.monotonic() + delay
+        logger.bind(tag=TAG).warning(
+            f"ASR connect failed ({self._connect_fail_count}); "
+            f"backing off {delay:.1f}s before retrying"
+        )
 
     async def _cleanup(self):
         self.is_processing = False
@@ -188,6 +218,7 @@ class ASRProvider(ASRProviderBase):
                 self.asr_ws = None
         self._final_event = None
         self._stop_sent = False
+        self._committed_text = ""
 
     # ------------------------------------------------------------------
     # Receive loop
@@ -233,9 +264,18 @@ class ASRProvider(ASRProviderBase):
                             self.last_partial = text
                         continue
                     if not self._stop_sent and not self.allow_backend_endpoint:
-                        # Backend self-endpointed; treat as a stable partial.
+                        # 引擎自己断句了。我们不把它当作「这轮说完了」（那会腰斩
+                        # 用户还没说完的话），但**必须把这一段的文本收下来** ——
+                        # 引擎已经在它那边翻篇了，后续 EOF 只会结算新的一段。
+                        #
+                        # 早先这里写的是 `self.last_partial = text`（覆盖），于是
+                        # 用户说话中间一停顿超过 vad_silence_ms，前面所有内容就被
+                        # 静默丢弃，最终只拿到最后一小段。实测：4.32s 音频完整送达
+                        # （实发字节与缓冲逐字节相等），却只识别出「嗯。」；把同一份
+                        # 字节离线整段转写则是「帮我查一下 SKU002 的库存。」。
                         if text:
-                            self.last_partial = text
+                            self._commit_segment(text)
+                            self.last_partial = ""
                         continue
                     # Either we triggered this via _send_stop_request, OR the
                     # backend detected its own endpoint (only when
@@ -244,11 +284,11 @@ class ASRProvider(ASRProviderBase):
                     if self._handling_voice_stop and not self._stop_sent:
                         # Another path already scheduled handle_voice_stop;
                         # just signal the final and exit.
-                        self.text = text or self.last_partial
+                        self.text = self._join_committed(text or self.last_partial)
                         if self._final_event is not None:
                             self._final_event.set()
                         break
-                    self.text = text or self.last_partial
+                    self.text = self._join_committed(text or self.last_partial)
                     if self._final_event is not None:
                         self._final_event.set()
                     if not self._stop_sent and self.allow_backend_endpoint:
@@ -284,6 +324,9 @@ class ASRProvider(ASRProviderBase):
 
         # Open a new ws on the first voiced frame of an utterance.
         if audio_have_voice and not self.is_processing and self.asr_ws is None:
+            import time as _t
+            if _t.monotonic() < self._next_connect_at:
+                return  # still backing off; drop this frame rather than pile on
             try:
                 await self._start_session(conn)
             except Exception as e:
@@ -300,17 +343,25 @@ class ASRProvider(ASRProviderBase):
                         "请检查地址/端口是否正确、OVS 服务是否已就绪(/readyz)"
                     )
                 await self._cleanup()
+                self._note_connect_failure()
                 return
 
         if self.asr_ws is not None and self.is_processing and self._pre_roll_done:
             try:
-                pcm_frame = self.decoder.decode(audio, 960)
-                await self.asr_ws.send(pcm_frame)
+                # `audio` is already PCM (see pre-roll comment above). Decoding
+                # it as Opus here fed libopus raw samples and raised
+                # `corrupted stream` on every single frame, so ASR never
+                # produced a result and the device sat in "listening" forever.
+                await self.asr_ws.send(audio)
             except Exception as e:
                 logger.bind(tag=TAG).warning(
                     f"OpenVoiceStream ASR send failed: {e}"
                 )
                 await self._cleanup()
+                # Count this too: a mid-utterance drop is followed by the very
+                # next audio frame trying to reopen, which is exactly how the
+                # storm starts.
+                self._note_connect_failure()
 
         # STREAM providers must self-trigger handle_voice_stop; framework's
         # auto-call in base.py:76 only applies to non-STREAM. Mirror the
@@ -324,6 +375,31 @@ class ASRProvider(ASRProviderBase):
             asr_audio_snapshot = list(conn.asr_audio)
             await self.handle_voice_stop(conn, asr_audio_snapshot)
             return
+
+    def _commit_segment(self, text: str) -> None:
+        """收下引擎自行断句产出的一段文本。"""
+        text = (text or "").strip()
+        if not text:
+            return
+        self._committed_text = self._concat(self._committed_text, text)
+
+    @staticmethod
+    def _concat(left: str, right: str) -> str:
+        """拼接两段识别文本。
+
+        中文之间不加空格（加了 TTS 会读出停顿、字幕也难看），拉丁字母相邻时补一个
+        空格，否则 "SKU" + "0002" 会粘成 "SKU0002" 影响后续匹配。
+        """
+        if not left:
+            return right
+        if not right:
+            return left
+        need_space = left[-1].isascii() and left[-1].isalnum() and \
+            right[0].isascii() and right[0].isalnum()
+        return left + (" " if need_space else "") + right
+
+    def _join_committed(self, tail: str) -> str:
+        return self._concat(self._committed_text, (tail or "").strip())
 
     async def _send_stop_request(self):
         """Tell backend the utterance is over so it produces a final.
@@ -392,9 +468,3 @@ class ASRProvider(ASRProviderBase):
 
     async def close(self):
         await self._cleanup()
-        if getattr(self, "decoder", None) is not None:
-            try:
-                del self.decoder
-            except Exception:
-                pass
-            self.decoder = None
