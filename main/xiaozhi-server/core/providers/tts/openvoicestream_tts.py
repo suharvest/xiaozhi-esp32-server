@@ -115,7 +115,11 @@ class TTSProvider(TTSProviderBase):
             )
         language = config.get("language", None)
         self.language = language if language else None
-        self.timeout = config.get("timeout", 30)
+        # Manager API may serialize numeric form fields as JSON strings. aiohttp
+        # compares ``total`` with numeric values internally, so passing "30"
+        # raises: TypeError: '>' not supported between instances of 'str' and
+        # 'int'. Normalize at the provider boundary just like speed/pitch.
+        self.timeout = float(config.get("timeout", 30))
         self.audio_format = "pcm"
         self.before_stop_play_files = []
 
@@ -223,19 +227,18 @@ class TTSProvider(TTSProviderBase):
 
     def to_tts_single_stream(self, text, is_last=False):
         try:
-            max_repeat_time = 5
             text = MarkdownCleaner.clean_markdown(text)
             try:
-                asyncio.run(self.text_to_speak(text, is_last))
+                succeeded = asyncio.run(self.text_to_speak(text, is_last))
             except Exception as e:
                 logger.bind(tag=TAG).warning(
-                    f"TTS generation failed {5 - max_repeat_time + 1} times: {text}, error: {e}"
+                    f"TTS generation failed: {text}, error: {e}"
                 )
-                max_repeat_time -= 1
+                succeeded = False
 
-            if max_repeat_time > 0:
+            if succeeded:
                 logger.bind(tag=TAG).info(
-                    f"TTS generation success: {text}, retries: {5 - max_repeat_time}"
+                    f"TTS generation success: {text}"
                 )
             else:
                 logger.bind(tag=TAG).error(
@@ -367,14 +370,14 @@ class TTSProvider(TTSProviderBase):
                 resp = await self._post_with_retry(session, payload)
                 if resp is None:
                     self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
-                    return
+                    return False
                 async with resp:
                     if resp.status != 200:
                         logger.bind(tag=TAG).error(
                             f"TTS request failed: {resp.status}, {await resp.text()}"
                         )
                         self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
-                        return
+                        return False
 
                     self.pcm_buffer.clear()
                     self.tts_audio_queue.put((SentenceType.FIRST, [], text, self.current_sentence_id))
@@ -431,9 +434,12 @@ class TTSProvider(TTSProviderBase):
                     if is_last:
                         self._process_before_stop_play_files()
 
+                    return True
+
         except Exception as e:
             logger.bind(tag=TAG).error(f"TTS request exception: {e}")
             self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
+            return False
 
     async def close(self):
         await super().close()
