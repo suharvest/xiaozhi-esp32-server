@@ -93,6 +93,11 @@ class ConnectionHandler:
         self.logger = setup_logging()
         self.server = server  # 保存server实例的引用
 
+        # 工具调用兜底状态：_pending_tool_answer 表示"本轮已发起工具调用但尚未
+        # 给出任何可播报结论"，由 chat() 在 depth==0 收尾时消费。
+        self._pending_tool_answer = False
+        self._last_tool_result_text = None
+
         self.need_bind = False  # 是否需要绑定设备
         self.bind_completed_event = asyncio.Event()
         self.bind_code = None  # 绑定设备的验证码
@@ -1043,6 +1048,9 @@ class ConnectionHandler:
         if depth == 0:
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性（仅供 TTS 过滤器识别"当前活跃轮次"）
+            # 本轮兜底状态复位：见 _pending_tool_answer 的说明
+            self._pending_tool_answer = False
+            self._last_tool_result_text = None
             self.dialogue.put(Message(role="user", content=query))
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
@@ -1176,6 +1184,7 @@ class ConnectionHandler:
                                     new_part = self._clean_response_garbage(new_part)
                                     if new_part:
                                         tc["_da_sent"] = safe_end
+                                        self._pending_tool_answer = False
                                         self.tts.tts_text_queue.put(
                                             TTSMessageDTO(
                                                 sentence_id=current_sentence_id,
@@ -1199,6 +1208,7 @@ class ConnectionHandler:
                 if content is not None and len(content) > 0:
                     if not tool_call_flag:
                         response_message.append(content)
+                        self._pending_tool_answer = False
                         self.tts.tts_text_queue.put(
                             TTSMessageDTO(
                                 sentence_id=current_sentence_id,
@@ -1209,6 +1219,7 @@ class ConnectionHandler:
                         )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
+            self._pending_tool_answer = False
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
                     sentence_id=current_sentence_id,
@@ -1304,6 +1315,9 @@ class ConnectionHandler:
                 self.logger.bind(tag=TAG).debug(
                     f"检测到 {len(tool_calls_list)} 个工具调用"
                 )
+                # 工具调用一旦发起，本轮就欠用户一个结论。任何后续文本输出会清掉
+                # 这个标记；若递归到 MAX_DEPTH 仍未清除，depth==0 收尾时兜底播报。
+                self._pending_tool_answer = True
 
                 # LLM 流式阶段已播报过的文本
                 streamed_text = ""
@@ -1374,6 +1388,8 @@ class ConnectionHandler:
                     try:
                         result = future.result(timeout=tool_call_timeout)
                         tool_results.append((result, tool_call_data))
+                        if result is not None and result.result:
+                            self._last_tool_result_text = str(result.result)
                         # 使用公共方法上报工具调用结果
                         enqueue_tool_report(self, tool_call_data['name'], tool_input, str(result.result) if result.result else None, report_tool_call=False)
 
@@ -1405,6 +1421,28 @@ class ConnectionHandler:
             self.dialogue.put(Message(role="assistant", content=text_buff))
 
         if depth == 0:
+            # 工具调用发生过、却一路递归到底都没产出任何可播报文本时的兜底。
+            # 典型场景：工具连续返回空结果，模型反复改参重试直至撞上 MAX_DEPTH，
+            # 强制回答那轮又吐了空内容 —— 此时若直接推 LAST，用户只会听到工具
+            # 调用前的那句「正在查询」，然后永久静默。
+            # client_abort：用户已打断，不该再补一句话
+            if self._pending_tool_answer and not self.client_abort:
+                fallback = self._build_tool_fallback_response()
+                self.logger.bind(tag=TAG).warning(
+                    f"工具调用后无任何回复内容，使用兜底话术: {fallback}"
+                )
+                self.tts.tts_text_queue.put(
+                    TTSMessageDTO(
+                        sentence_id=current_sentence_id,
+                        sentence_type=SentenceType.MIDDLE,
+                        content_type=ContentType.TEXT,
+                        content_detail=fallback,
+                    )
+                )
+                self.tts.store_tts_text(current_sentence_id, fallback)
+                self.dialogue.put(Message(role="assistant", content=fallback))
+                self._pending_tool_answer = False
+
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
                     sentence_id=current_sentence_id,
@@ -1421,6 +1459,30 @@ class ConnectionHandler:
 
         return True
 
+    def _build_tool_fallback_response(self) -> str:
+        """工具跑完没有结论时的播报文本。
+
+        优先复用最后一次工具返回里的自然语言字段——很多 MCP 工具（如仓库侧）
+        已经把「未找到备品：100201」这类可直接播报的句子放在 say 里，比通用
+        错误话术信息量高得多。取不到才退回通用话术。
+        """
+        raw = getattr(self, "_last_tool_result_text", None)
+        if raw:
+            for candidate in (raw, extract_json_from_string(raw)):
+                if not isinstance(candidate, str):
+                    continue
+                try:
+                    parsed = json.loads(candidate)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                for key in ("say", "message", "msg", "text"):
+                    value = parsed.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+        return get_system_error_response(self.config)
+
     def _handle_function_result(self, tool_results, depth, streamed_text="", current_sentence_id=None):
         # current_sentence_id 必须由 chat() 传入，避免在递归途中读取被新轮覆盖的 self.sentence_id
         if current_sentence_id is None:
@@ -1434,6 +1496,8 @@ class ConnectionHandler:
                 Action.NOTFOUND,
                 Action.ERROR,
             ]:
+                # 工具自带结论并直接播报，本轮不再欠用户答复
+                self._pending_tool_answer = False
                 text = result.response if result.response else result.result
                 if streamed_text and text in streamed_text:
                     self.logger.bind(tag=TAG).debug(
