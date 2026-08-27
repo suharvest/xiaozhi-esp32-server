@@ -4,4 +4,15 @@ __pycache__
 .env
 Dockerfile
 tmp/
-data/
+# 只排运行时数据目录。这里不能写成裸 "data/" —— .dockerignore 的无前缀
+# 模式匹配任意层级，会把
+#   main/xiaozhi-server/models/snakers4_silero-vad/src/silero_vad/data/
+# 里的 VAD 权重一并排除。COPY 是整目录拷贝，丢了也不报错，直到运行时
+# 才炸在 onnxruntime：
+#   NO_SUCHFILE: Load model from .../silero_vad/data/silero_vad.onnx failed
+# 2026-08-27 客户 Jetson 上踩到，语音服务起不来。
+main/xiaozhi-server/data/
+
+# macOS 打包产生的 AppleDouble，别带进镜像
+._*
+.DS_Store
