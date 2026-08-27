@@ -6,12 +6,11 @@ import wave
 import socket
 import asyncio
 import requests
-import subprocess
 import numpy as np
 import opuslib_next
 from io import BytesIO
 from core.utils import p3
-from pydub import AudioSegment
+import av
 from typing import Callable, Any
 
 TAG = __name__
@@ -154,67 +153,34 @@ def parse_string_to_list(value, separator=";"):
     return []
 
 
-def check_ffmpeg_installed() -> bool:
+def check_audio_decoder_installed() -> bool:
     """
-    检查当前环境中是否已正确安装并可执行 ffmpeg。
+    检查音频解码器是否可用。
+
+    解码走 PyAV（wheel 自带 ffmpeg 库），不依赖系统 ffmpeg 可执行文件。
 
     Returns:
-        bool: 如果 ffmpeg 正常可用，返回 True；否则抛出 ValueError 异常。
+        bool: 解码器可用返回 True。
 
     Raises:
-        ValueError: 当检测到 ffmpeg 未安装或依赖缺失时，抛出详细的提示信息。
+        ValueError: PyAV 缺失或动态库加载失败时抛出。
     """
     try:
-        # 尝试执行 ffmpeg 命令
-        result = subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True,  # 非零退出码会触发 CalledProcessError
-        )
-
-        output = (result.stdout + result.stderr).lower()
-        if "ffmpeg version" in output:
-            return True
-
-        # 如果未检测到版本信息，也视为异常情况
-        raise ValueError("未检测到有效的 ffmpeg 版本输出。")
-
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        # 提取错误输出
-        stderr_output = ""
-        if isinstance(e, subprocess.CalledProcessError):
-            stderr_output = (e.stderr or "").strip()
-        else:
-            stderr_output = str(e).strip()
-
-        # 构建基础错误提示
-        error_msg = [
-            "❌ 检测到 ffmpeg 无法正常运行。\n",
-            "建议您：",
-            "1. 确认已正确激活 conda 环境；",
-            "2. 查阅项目安装文档，了解如何在 conda 环境中安装 ffmpeg。\n",
-        ]
-
-        # 🎯 针对具体错误信息提供额外提示
-        if "libiconv.so.2" in stderr_output:
-            error_msg.append("⚠️ 发现缺少依赖库：libiconv.so.2")
-            error_msg.append("解决方法：在当前 conda 环境中执行：")
-            error_msg.append("   conda install -c conda-forge libiconv\n")
-        elif (
-            "no such file or directory" in stderr_output
-            and "ffmpeg" in stderr_output.lower()
-        ):
-            error_msg.append("⚠️ 系统未找到 ffmpeg 可执行文件。")
-            error_msg.append("解决方法：在当前 conda 环境中执行：")
-            error_msg.append("   conda install -c conda-forge ffmpeg\n")
-        else:
-            error_msg.append("错误详情：")
-            error_msg.append(stderr_output or "未知错误。")
-
-        # 抛出详细异常信息
-        raise ValueError("\n".join(error_msg)) from e
+        av.codec.Codec("pcm_s16le", "r")
+        av.codec.Codec("mp3", "r")
+        return True
+    except Exception as e:
+        raise ValueError(
+            "\n".join(
+                [
+                    "❌ 音频解码器不可用。\n",
+                    "解码依赖 PyAV，请确认已安装：",
+                    "   pip install av\n",
+                    "错误详情：",
+                    str(e) or "未知错误。",
+                ]
+            )
+        ) from e
 
 
 def extract_json_from_string(input_string):
@@ -226,6 +192,28 @@ def extract_json_from_string(input_string):
     return None
 
 
+def decode_to_pcm(source, file_type: str, sample_rate: int = 16000) -> bytes:
+    """
+    把音频解码成单声道 / 指定采样率 / 16 位小端的裸 PCM。
+
+    source 可以是文件路径，也可以是类文件对象（如 BytesIO）。
+    file_type 为空时交给 PyAV 自行探测容器格式。
+    """
+    fmt = file_type or None
+    resampler = av.AudioResampler(format="s16", layout="mono", rate=sample_rate)
+    chunks = []
+    with av.open(source, format=fmt) as container:
+        stream = container.streams.audio[0]
+        for frame in container.decode(stream):
+            for out in resampler.resample(frame):
+                # planes[0] 的缓冲区按 32 字节对齐，尾部有填充，按样本数截断
+                chunks.append(bytes(out.planes[0])[: out.samples * 2])
+        # flush 重采样器内部残留的样本
+        for out in resampler.resample(None):
+            chunks.append(bytes(out.planes[0])[: out.samples * 2])
+    return b"".join(chunks)
+
+
 def audio_to_data_stream(
     audio_file_path, is_opus=True, callback: Callable[[Any], Any] = None, sample_rate=16000, opus_encoder=None
 ) -> None:
@@ -233,16 +221,7 @@ def audio_to_data_stream(
     file_type = os.path.splitext(audio_file_path)[1]
     if file_type:
         file_type = file_type.lstrip(".")
-    # 读取音频文件，-nostdin 参数：不要从标准输入读取数据，否则FFmpeg会阻塞
-    audio = AudioSegment.from_file(
-        audio_file_path, format=file_type, parameters=["-nostdin"]
-    )
-
-    # 转换为单声道/指定采样率/16位小端编码（确保与编码器匹配）
-    audio = audio.set_channels(1).set_frame_rate(sample_rate).set_sample_width(2)
-
-    # 获取原始PCM数据（16位小端）
-    raw_data = audio.raw_data
+    raw_data = decode_to_pcm(audio_file_path, file_type, sample_rate)
     pcm_to_data_stream(raw_data, is_opus, callback, sample_rate, opus_encoder)
 
 
@@ -273,16 +252,7 @@ async def audio_to_data(
         file_type = os.path.splitext(audio_file_path)[1]
         if file_type:
             file_type = file_type.lstrip(".")
-        # 读取音频文件，-nostdin 参数：不要从标准输入读取数据，否则FFmpeg会阻塞
-        audio = AudioSegment.from_file(
-            audio_file_path, format=file_type, parameters=["-nostdin"]
-        )
-
-        # 转换为单声道/16kHz采样率/16位小端编码（确保与编码器匹配）
-        audio = audio.set_channels(1).set_frame_rate(16000).set_sample_width(2)
-
-        # 获取原始PCM数据（16位小端）
-        raw_data = audio.raw_data
+        raw_data = decode_to_pcm(audio_file_path, file_type, 16000)
 
         # 初始化Opus编码器
         encoder = opuslib_next.Encoder(16000, 1, opuslib_next.APPLICATION_AUDIO)
@@ -334,12 +304,7 @@ def audio_bytes_to_data_stream(
         # 直接用p3解码
         return p3.decode_opus_from_bytes_stream(audio_bytes, callback)
     else:
-        # 其他格式用pydub
-        audio = AudioSegment.from_file(
-            BytesIO(audio_bytes), format=file_type, parameters=["-nostdin"]
-        )
-        audio = audio.set_channels(1).set_frame_rate(sample_rate).set_sample_width(2)
-        raw_data = audio.raw_data
+        raw_data = decode_to_pcm(BytesIO(audio_bytes), file_type, sample_rate)
         pcm_to_data_stream(raw_data, is_opus, callback, sample_rate, opus_encoder)
 
 
