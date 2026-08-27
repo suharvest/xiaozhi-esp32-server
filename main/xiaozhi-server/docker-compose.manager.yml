@@ -45,6 +45,10 @@ services:
       - default
     expose:
       - 3306
+    ports:
+      # 本机开发用：manager-api 跑在宿主上（mvn spring-boot:run）时需要直连 DB。
+      # 只绑 127.0.0.1，不对局域网暴露（root 密码是弱口令 123456）。
+      - "127.0.0.1:3306:3306"
     volumes:
       - ./mysql/data:/var/lib/mysql
     environment:
@@ -57,6 +61,9 @@ services:
     image: redis:8.0
     expose:
       - 6379
+    ports:
+      # 同上：本机开发用，只绑 127.0.0.1
+      - "127.0.0.1:6379:6379"
     container_name: xiaozhi-esp32-server-redis
     restart: always
     healthcheck:
