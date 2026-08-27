@@ -16,3 +16,10 @@ main/xiaozhi-server/data/
 # macOS 打包产生的 AppleDouble，别带进镜像
 ._*
 .DS_Store
+
+# 本地虚拟环境：3GB+，且镜像自己 pip install 依赖，拷进去纯属浪费。
+# 当初构建时本地还没有这些目录，所以旧镜像侥幸没受影响。
+.venv/
+.venv-*/
+**/.venv/
+**/.venv-*/
