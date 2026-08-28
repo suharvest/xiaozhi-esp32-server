@@ -1,7 +1,7 @@
 numpy==1.26.4
 websockets==14.2
 opuslib_next==1.1.5
-pydub==0.25.1
+av==17.1.0
 openai==2.8.1
 edge_tts==7.2.6
 httpx==0.28.1

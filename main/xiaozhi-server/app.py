@@ -8,7 +8,7 @@ from config.logger import setup_logging
 from core.utils.util import get_local_ip, validate_mcp_endpoint
 from core.http_server import SimpleHttpServer
 from core.websocket_server import WebSocketServer
-from core.utils.util import check_ffmpeg_installed
+from core.utils.util import check_audio_decoder_installed
 from core.utils.gc_manager import get_gc_manager
 
 TAG = __name__
@@ -44,7 +44,7 @@ async def monitor_stdin():
 
 
 async def main():
-    check_ffmpeg_installed()
+    check_audio_decoder_installed()
     config = await load_config()
 
     # auth_key优先级：配置文件server.auth_key > manager-api.secret > 自动生成
