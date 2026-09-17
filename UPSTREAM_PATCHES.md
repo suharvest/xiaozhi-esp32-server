@@ -171,6 +171,59 @@ revert the config.yaml block), or runtime-disable by writing
 
 **Verify after merge**: `grep -n "_start_listen_timeout\|_cancel_listen_timeout\|_listen_timeout_waiter" core/providers/asr/base.py` ≥ 6 hits; `grep -n "_start_listen_timeout" core/handle/textHandler/listenMessageHandler.py` = 1 hit; `grep -n "listen 超时兜底" core/providers/asr/base.py` present; `grep -n "asr_listen_timeout" config.yaml` = 3 keys.
 
+### B1e. OVS TTS 会话槽节流（2026-09-16）
+
+**What**: `core/providers/tts/openvoicestream_tts.py` + `config.yaml`。首句之后
+按最小字数合并 TTS 分段、断开/换轮即中止在途 HTTP 流、429 重试收敛到有界等待。
+
+**Why**: 现场 OVS 会话池是**全局计数器 2**（ASR 后端 1 + TTS 后端 1 相加，
+`session_limiter.py` 不分模态）。每轮问答的 LLM 回答被切成 3~5 条 TTS HTTP
+流，每条各抢一次槽；多设备并发或设备重连时 429（`too_many_sessions`）→
+ASR 拿不到槽 → 走 B1b 兜底播「识别服务暂时不可用」→ 设备回待命，用户感受
+「问一句不理人」。
+
+**How**:
+- **(A) 分段合并**：`_get_segment_text()` 覆盖 base 实现。首句沿用 base 规则
+  （`first_sentence_max_chars`，首音频延迟不变）；之后攒够
+  `subsequent_sentence_min_chars`（默认 **32**）字或收到 LAST 才发一条流，
+  余文由 `_process_remaining_text_stream` 排空，不会丢字。
+  配套：`client_abort` / sentence_id 换轮丢弃文本时一并清
+  `processed_chars`/`tts_text_buff`；`SentenceType.FIRST` 分支补
+  `is_first_sentence = True`（与 `tts/base.py:408` 对齐），否则子类会把整轮
+  都当后续句缓冲、首音频被拖慢。
+- **(B) 在途流可中止**：`text_to_speak` 的音频读取从 `async for
+  resp.content.iter_any()` 改成 `wait_for(resp.content.readany(), 0.25)` 轮询，
+  每次轮询前用 `_make_stop_checker(sid)` 检查 `_closed` / `conn.client_abort` /
+  `conn.stop_event` / sentence_id 是否换轮；命中即 break，**不 flush 尾音、不
+  推 LAST**，直接退出 `async with resp` 关连接，OVS 侧随即释放槽。
+  `close()` 先置 `self._closed = True`，在途流在下一个 0.25s 轮询点自行退出。
+- **(C) 429 重试收敛**：`_post_with_retry(..., stopped=)` 用
+  `max_retries`（**2**）、单次退避与 `Retry-After` 都夹到 `retry_max_delay`
+  （**1.5s**）、整个重试阶段共享 `retry_budget_seconds`（**3.0s**）deadline；
+  退避改成 0.1s 分片睡，睡的过程中命中 `stopped()` 立即放弃。超预算即放弃
+  这一句交回上层兜底，而不是把整轮堵死。
+- **顺带修**：`_process_remaining_text_stream` 里 `processed_chars += len(full_text)`
+  应为 `=`（它是「已消费字符数」不是增量），原写法多次调用后越界，后续文本
+  被整段跳过。
+
+**Config**（`TTS.OpenVoiceStream` 块，默认值即现场值）：
+`subsequent_sentence_min_chars: 32`、`max_retries: 2`、`retry_max_delay: 1.5`、
+`retry_budget_seconds: 3.0`。
+
+**Tests**: `main/xiaozhi-server/tmp/test_tts_slot_saving.py`（a–g，容器内 stdin
+运行）：(a) 首句仍按 base 规则出；(b) 后续句不足 32 字不发流；(c) 攒够即发；
+(d) LAST 排空余文且 `processed_chars` 不越界；(e) 换轮/abort 清缓冲；
+(f) `stopped()` 命中时中途退出且不推 LAST；(g) 重试预算耗尽返回 None。
+
+**Deployed**: 现场镜像 `arm64-fix-20260916e`（瘦镜像）/ registry
+`arm64-20260916`。切换后 10 分钟真实流量：`ovs_sessions_rejected_total` **0**，
+每轮 TTS 流条数从 **3~5 降到 2**。
+
+**Rollback**: 镜像回退 `arm64-fix-20260916d`（compose `image:` 行 +
+`docker compose up -d xiaozhi-server`）。
+
+**Verify after merge**: `grep -n "_make_stop_checker\|subsequent_sentence_min_chars\|retry_budget_seconds" core/providers/tts/openvoicestream_tts.py` ≥ 3 hits。
+
 > **SUPERSEDED — VAD ONNX patch (commit `0ad7cf4a`).** We used to carry a
 > `core/providers/vad/silero_onnx_wrapper.py` shim so Silero VAD ran on
 > onnxruntime instead of torch. Upstream has since rewritten
