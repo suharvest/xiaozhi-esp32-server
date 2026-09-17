@@ -162,6 +162,8 @@ class ASRProvider(ASRProviderBase):
         self.is_processing = True
         self._connect_fail_count = 0
         self._next_connect_at = 0.0
+        # 新一轮开始，重置失败原因，避免跨轮串味
+        self.asr_failed_reason = None
         self.last_partial = ""
         self._stop_sent = False
         self._pre_roll_done = False
@@ -236,6 +238,7 @@ class ASRProvider(ASRProviderBase):
                     raise
                 except Exception as e:
                     logger.bind(tag=TAG).warning(f"ws recv error: {e}")
+                    self.asr_failed_reason = "backend_error"
                     break
 
                 try:
@@ -310,6 +313,8 @@ class ASRProvider(ASRProviderBase):
             raise
         except Exception as e:
             logger.bind(tag=TAG).error(f"OpenVoiceStream receive loop error: {e}")
+            # 接收循环异常：标记后端错误，供兜底播报选择话术
+            self.asr_failed_reason = "backend_error"
 
     # ------------------------------------------------------------------
     # Public ASR hooks
@@ -344,6 +349,8 @@ class ASRProvider(ASRProviderBase):
                     )
                 await self._cleanup()
                 self._note_connect_failure()
+                # 连接失败/握手超时：本轮 ASR 后端不可达
+                self.asr_failed_reason = "backend_unreachable"
                 return
 
         if self.asr_ws is not None and self.is_processing and self._pre_roll_done:
@@ -362,6 +369,8 @@ class ASRProvider(ASRProviderBase):
                 # next audio frame trying to reopen, which is exactly how the
                 # storm starts.
                 self._note_connect_failure()
+                # 发送音频失败：本轮 ASR 后端不可达
+                self.asr_failed_reason = "backend_unreachable"
 
         # STREAM providers must self-trigger handle_voice_stop; framework's
         # auto-call in base.py:76 only applies to non-STREAM. Mirror the
@@ -435,6 +444,9 @@ class ASRProvider(ASRProviderBase):
                     )
                     if self.fallback_to_partial and self.last_partial:
                         self.text = self.last_partial
+                    else:
+                        # 超时且没有任何 partial：本轮无任何识别产出
+                        self.asr_failed_reason = "timeout"
         except Exception as e:
             logger.bind(tag=TAG).error(f"OpenVoiceStream handle_voice_stop error: {e}")
         finally:

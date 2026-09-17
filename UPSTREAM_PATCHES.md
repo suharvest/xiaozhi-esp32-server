@@ -45,6 +45,35 @@ Grouped by theme. Each row: what we changed + why + how to verify after merge.
 | `config.yaml` | Added `OpenVoiceStream` ASR/TTS provider blocks, `EdgeLLM` LLM block; default `selected_module` may reference them | `grep -E "OpenVoiceStream\|EdgeLLM" config.yaml` present; provider blocks intact |
 | `core/providers/asr/sherpa_onnx_local.py` | Moved `modelscope` import inside the function (lazy) for macOS compat | import is inside the method, not module top |
 
+### B1b. ASR fallback reply (2026-09-14)
+
+**What**: `core/providers/asr/base.py` + `core/providers/asr/openvoicestream.py`
++ `config.yaml`. When ASR produces no text (backend unreachable / exception /
+final-timeout with no partial / empty recognition), the server now speaks a
+fallback phrase via TTS (FIRST+LAST single sentence, copied from
+`intentHandler.speak_txt`) so the device finishes playback and returns to
+standby instead of being stuck in "listening" until power-cycle.
+
+**Why**: on the CM5 field box, an unreachable OVS backend made the server send
+nothing at all — `handle_voice_stop()` only replied `if text_len > 0`, the
+`else` branch was empty.
+
+**How**: providers set `self.asr_failed_reason` (`backend_unreachable` /
+`timeout` / `backend_error`); base picks `asr_failure_reply` (default
+"识别服务暂时不可用，请稍后再试") when a reason is set, else
+`asr_empty_reply` (default "没听清，请再说一遍"). Guarded by
+`asr_fallback_enabled` (default true), `conn.client_abort`,
+`conn.stop_event`; whole branch wrapped in try/except (warning only).
+Explicit empty string for a reply key disables that branch.
+
+**Rollback**: redeploy image tag `arm64-fix20260806` (edit compose `image:`
+line back + `docker compose up -d xiaozhi-server`), or set
+`asr_fallback_enabled: false` in `data/.config.yaml`.
+
+**Verify after merge**: `grep -n "_maybe_speak_asr_fallback"
+core/providers/asr/base.py` present; `grep -n "asr_failed_reason"
+core/providers/asr/openvoicestream.py` ≥ 6 hits; `grep -n "asr_fallback_enabled" config.yaml` present.
+
 > **SUPERSEDED — VAD ONNX patch (commit `0ad7cf4a`).** We used to carry a
 > `core/providers/vad/silero_onnx_wrapper.py` shim so Silero VAD ran on
 > onnxruntime instead of torch. Upstream has since rewritten

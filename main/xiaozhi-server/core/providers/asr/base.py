@@ -18,6 +18,7 @@ from core.handle.receiveAudioHandle import startToChat
 from core.handle.reportHandle import enqueue_asr_report
 from core.utils.util import remove_punctuation_and_length
 from core.handle.receiveAudioHandle import handleAudioMessage
+from core.providers.tts.dto.dto import ContentType, SentenceType, TTSMessageDTO
 from typing import Optional, Tuple, List, NamedTuple, TYPE_CHECKING
 
 
@@ -30,7 +31,10 @@ logger = setup_logging()
 
 class ASRProviderBase(ABC):
     def __init__(self):
-        pass
+        # ASR 失败原因标记，由具体 provider 置位（如 backend_unreachable /
+        # timeout / backend_error），供 handle_voice_stop 的兜底播报选择话术。
+        # 每轮识别结束后会复位为 None，避免跨轮串味。
+        self.asr_failed_reason = None
 
     # 打开音频通道
     async def open_audio_channels(self, conn: "ConnectionHandler"):
@@ -168,11 +172,84 @@ class ASRProviderBase(ABC):
                 enqueue_asr_report(conn, enhanced_text, audio_snapshot)
                 # 使用自定义模块进行上报
                 await startToChat(conn, enhanced_text)
+            else:
+                # ASR 没有任何产出（后端不可达/异常/超时/识别为空）。
+                # 不能什么都不发，否则设备会一直停在「聆听中」只能断电。
+                reason = getattr(self, "asr_failed_reason", None)
+                self.asr_failed_reason = None
+                self._maybe_speak_asr_fallback(conn, reason)
         except Exception as e:
             logger.bind(tag=TAG).error(f"处理语音停止失败: {e}")
             import traceback
 
             logger.bind(tag=TAG).debug(f"异常详情: {traceback.format_exc()}")
+
+    def _maybe_speak_asr_fallback(self, conn: "ConnectionHandler", reason: Optional[str]):
+        """ASR 无结果时补播一句兜底话术，让设备播完并回到「待命」。
+
+        写法照抄 core/handle/intentHandler.py 的 speak_txt()：FIRST+LAST 单独成句。
+        任何异常只打 warning，绝不能让 handle_voice_stop 崩。
+        """
+        try:
+            if not conn.config.get("asr_fallback_enabled", True):
+                return
+            if getattr(conn, "client_abort", False):
+                logger.bind(tag=TAG).info("用户已打断，跳过ASR兜底播报")
+                return
+            if conn.stop_event.is_set():
+                return
+            if reason:
+                phrase = conn.config.get(
+                    "asr_failure_reply", "识别服务暂时不可用，请稍后再试"
+                )
+            else:
+                phrase = conn.config.get("asr_empty_reply", "没听清，请再说一遍")
+            if not phrase:
+                # 显式空字符串 = 该分支不播报
+                return
+            self._speak_fallback_phrase(conn, phrase)
+        except Exception as e:
+            logger.bind(tag=TAG).warning(f"ASR兜底播报失败: {e}")
+
+    def _speak_fallback_phrase(self, conn: "ConnectionHandler", phrase: str):
+        """按 FIRST+LAST 单句播一条兜底话术（供 ASR 空结果兜底与 listen 超时兜底复用）。
+        任何异常只打 warning，绝不能让上层崩。
+        """
+        try:
+            if getattr(conn, "client_abort", False):
+                logger.bind(tag=TAG).info("用户已打断，跳过兜底播报")
+                return
+            if conn.stop_event.is_set():
+                return
+            # A4 兜底去重：8 秒内不重复播（避免 listen 超时兜底与 ASR 空结果
+            # 兜底连播两句）
+            now = time.monotonic()
+            if now - getattr(conn, "_last_fallback_ts", 0.0) < 8:
+                logger.bind(tag=TAG).info("8秒内已播过兜底话术，跳过重复播报")
+                return
+            conn._last_fallback_ts = now
+            logger.bind(tag=TAG).warning(
+                f"补播兜底话术: phrase={phrase!r}"
+            )
+            conn.sentence_id = str(uuid.uuid4().hex)
+            conn.tts.store_tts_text(conn.sentence_id, phrase)
+            conn.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=conn.sentence_id,
+                    sentence_type=SentenceType.FIRST,
+                    content_type=ContentType.ACTION,
+                )
+            )
+            conn.tts.tts_one_sentence(conn, ContentType.TEXT, content_detail=phrase)
+            conn.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=conn.sentence_id,
+                    sentence_type=SentenceType.LAST,
+                    content_type=ContentType.ACTION,
+                )
+            )
+        except Exception as e:
+            logger.bind(tag=TAG).warning(f"兜底播报失败: {e}")
 
     def _build_enhanced_text(self, text: str, speaker_name: Optional[str]) -> str:
         """构建包含说话人信息的文本（仅用于纯文本ASR）"""
