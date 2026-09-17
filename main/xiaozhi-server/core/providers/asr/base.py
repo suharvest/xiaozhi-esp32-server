@@ -87,6 +87,8 @@ class ASRProviderBase(ABC):
     # 处理语音停止
     async def handle_voice_stop(self, conn: "ConnectionHandler", asr_audio_task: List[bytes]):
         """并行处理ASR和声纹识别"""
+        # 语音停止/ASR出文本都会走到这里，本轮 listen 超时兜底定时器必须取消
+        self._cancel_listen_timeout(conn)
         try:
             total_start_time = time.monotonic()
 
@@ -250,6 +252,61 @@ class ASRProviderBase(ABC):
             )
         except Exception as e:
             logger.bind(tag=TAG).warning(f"兜底播报失败: {e}")
+
+    # ------------------------------------------------------------------
+    # listen 超时兜底：进入聆听态后 N 秒内既无 ASR 文本也无 voice_stop
+    #（如设备 WiFi 抖动/固件卡死导致音频根本没上传），服务端主动补播一句
+    # 并复位本轮状态，避免设备一直亮红灯卡在「聆听中」。
+    # ------------------------------------------------------------------
+    def _cancel_listen_timeout(self, conn: "ConnectionHandler"):
+        task = getattr(conn, "_listen_timeout_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        conn._listen_timeout_task = None
+
+    def _start_listen_timeout(self, conn: "ConnectionHandler"):
+        """收到 listen start 后起表；功能关闭时行为与原来完全一致。"""
+        self._cancel_listen_timeout(conn)
+        if not conn.config.get("asr_listen_timeout_enabled", True):
+            return
+        try:
+            sec = float(conn.config.get("asr_listen_timeout_sec", 15))
+        except (TypeError, ValueError):
+            sec = 15.0
+        if sec <= 0:
+            return
+        conn._listen_timeout_task = asyncio.create_task(
+            self._listen_timeout_waiter(conn, sec)
+        )
+
+    async def _listen_timeout_waiter(self, conn: "ConnectionHandler", sec: float):
+        try:
+            await asyncio.sleep(sec)
+        except asyncio.CancelledError:
+            # 正常取消（ASR出文本/voice_stop/client_abort/新一轮listen/连接关闭）
+            return
+        audio_frames = 0
+        try:
+            audio_frames = len(getattr(conn, "asr_audio", None) or [])
+            if getattr(conn, "client_abort", False):
+                logger.bind(tag=TAG).info("用户已打断，跳过listen超时兜底")
+                return
+            if conn.stop_event.is_set():
+                return
+            logger.bind(tag=TAG).warning(
+                f"listen 超时兜底: session_id={conn.session_id}, "
+                f"已等待={sec:.0f}s, 收到音频帧数={audio_frames}, 补播兜底话术"
+            )
+            # 话术：默认沿用 asr_empty_reply；显式空字符串 = 不播
+            reply = conn.config.get("asr_listen_timeout_reply")
+            if reply is None:
+                reply = conn.config.get("asr_empty_reply", "没听清，请再说一遍")
+            if reply:
+                self._speak_fallback_phrase(conn, reply)
+            # 复位本轮聆听状态，让设备播完能回到待命
+            conn.reset_audio_states()
+        except Exception as e:
+            logger.bind(tag=TAG).warning(f"listen 超时兜底执行失败: {e}")
 
     def _build_enhanced_text(self, text: str, speaker_name: Optional[str]) -> str:
         """构建包含说话人信息的文本（仅用于纯文本ASR）"""

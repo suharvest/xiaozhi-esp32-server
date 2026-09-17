@@ -74,6 +74,68 @@ line back + `docker compose up -d xiaozhi-server`), or set
 core/providers/asr/base.py` present; `grep -n "asr_failed_reason"
 core/providers/asr/openvoicestream.py` ≥ 6 hits; `grep -n "asr_fallback_enabled" config.yaml` present.
 
+### B1d. 工具结果上下文压缩（保真窗口 2 轮 / 历史压缩 / 上报不受影响）+ 上下文超限裁剪重试 + LLM 异常 FIRST+LAST 播报 (2026-09-16)
+
+**What**: `core/connection.py` + `core/providers/asr/base.py` + `config.yaml`。
+EdgeLLM 上下文上限 8192（可用输入 ~7064 token）不可上调，历史轮次里
+`query_stock`/`search` 等工具返回的大 JSON 把上下文撑爆，此后该会话每句
+都 400（`input_too_long`），用户感受「老是不回」；且 LLM 异常分支原来用
+单句 MIDDLE 播报，设备通常不播、也不回待命（静默）。
+
+**A1 工具结果压缩**（只作用于「喂给 LLM 的 `role="tool"` 消息内容」，
+挂点仅限 `_handle_function_result()` 的 RECORD / REQLLM 两个写 tool 消息
+分支；`enqueue_tool_report()` 仍收到**原始**工具结果，控制台历史/记忆
+不受影响）：
+- **保真窗口 = 最近 `tool_result_raw_turns` 轮**（默认 **2**，user→assistant
+  为一轮）：窗口内 tool 内容**逐字保留**；单条超宽松上限
+  `tool_result_latest_max_chars`（默认 **4000**）时只剥离与回答无关的
+  巨型数组（`data`/`candidates`），`say` 全文保留；
+- **窗口外的历史 tool 结果一律激进压缩**：保留 `ok`/`say`/`message` 等
+  短字段 + 候选摘要（名字+库存+库位，最多
+  `tool_result_candidate_limit`=**5** 条），套
+  `tool_result_max_chars`（默认 **600**，仅作用于窗口外历史）；
+- `stock_in`/`stock_out` 等写操作的 `say`/`message` **逐字保留（无论新旧）**；
+- 划分方式（确定性，不用时间戳猜）：每次新一轮（`chat()` depth==0）开始
+  时，以 dialogue 中**倒数第 N 个 user 消息**为界，把界前的 tool 消息就地
+  压缩一次（带 `_tool_ctx_compressed` 标记，不重复压缩）。选「新轮开始时
+  就地压缩」而非「拼装请求时压缩」，是因为检索路径（`get_llm_dialogue*`）
+  有多个调用方，就地压缩只做一次、对所有调用方生效且不碰 dialogue.py；
+- 只截内容、不删消息，OpenAI 工具协议（tool_calls/tool_call_id）完整。
+
+**A2 上下文超限裁剪重试**：LLM 调用/流式消费遇 `input_too_long` →
+可 grep WARNING「上下文超限」（含 got_tokens/max 数字）→ 确定性裁剪
+（只留 system + 最近 2 轮 user + 最近一次工具交互，重对齐 tool_calls/tool
+配对，不依赖 tokenizer）→ **最多重试一次**；仍失败 → 清空会话上下文
+（保留 system 与 few-shot）+ FIRST+LAST 播 `llm_context_overflow_reply`
+（默认「信息太多，我先清一下，请再说一遍」）。
+
+**A3 LLM 异常分支改 FIRST+LAST**：非超限 LLM 异常用
+`_speak_llm_fallback()`（写法同 `asr/base.py::_speak_fallback_phrase`，
+已验证单句 MIDDLE 设备不播），话术取 `llm_error_reply`（默认沿用
+`get_system_error_response()`）；守卫 `client_abort`/`stop_event`，
+整个分支 try/except 只打 warning。
+
+**A4 兜底去重**：`asr/base.py::_speak_fallback_phrase` 记录
+`conn._last_fallback_ts`，8 秒内不重复播（避免 listen 超时兜底与 ASR 空
+结果兜底连播两句）。
+
+**Config**（默认值，无需现场改动）：`tool_result_raw_turns: 2`、
+`tool_result_latest_max_chars: 4000`、`tool_result_max_chars: 600`、
+`tool_result_candidate_limit: 5`、`llm_context_overflow_reply`
+（`llm_error_reply` 注释掉，默认沿用 system_error_response）。
+
+**Tests**: `main/xiaozhi-server/tmp/test_context_overflow.py`（容器内 stdin
+运行）：(a) 窗口外历史压缩到上限内且含候选摘要；(b) 窗口内逐字保留、
+超限只剥巨型数组；(c) `enqueue_tool_report` 收到原始串；(d)(e)
+input_too_long 裁剪重试/清空兜底；(f) 裁剪协议完整性；(g) 兜底 8 秒去重。
+
+**Rollback**: 镜像回退 `arm64-allpatch-20260914c`（compose image 行 +
+`up -d --no-deps xiaozhi-server`）。
+
+**Verify after merge**: `grep -n "_compress_tool_results_outside_raw_window\|_cap_latest_tool_result_for_context\|_run_llm_stream_with_overflow_retry\|_speak_llm_fallback" core/connection.py` ≥ 6 hits；
+`grep -n "tool_result_raw_turns" config.yaml` present；
+`grep -n "_last_fallback_ts" core/providers/asr/base.py` present。
+
 > **SUPERSEDED — VAD ONNX patch (commit `0ad7cf4a`).** We used to carry a
 > `core/providers/vad/silero_onnx_wrapper.py` shim so Silero VAD ran on
 > onnxruntime instead of torch. Upstream has since rewritten
