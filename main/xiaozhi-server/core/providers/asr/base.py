@@ -179,14 +179,21 @@ class ASRProviderBase(ABC):
                 # 不能什么都不发，否则设备会一直停在「聆听中」只能断电。
                 reason = getattr(self, "asr_failed_reason", None)
                 self.asr_failed_reason = None
-                self._maybe_speak_asr_fallback(conn, reason)
+                self._maybe_speak_asr_fallback(
+                    conn, reason, audio_frames=len(asr_audio_task)
+                )
         except Exception as e:
             logger.bind(tag=TAG).error(f"处理语音停止失败: {e}")
             import traceback
 
             logger.bind(tag=TAG).debug(f"异常详情: {traceback.format_exc()}")
 
-    def _maybe_speak_asr_fallback(self, conn: "ConnectionHandler", reason: Optional[str]):
+    def _maybe_speak_asr_fallback(
+        self,
+        conn: "ConnectionHandler",
+        reason: Optional[str],
+        audio_frames: Optional[int] = None,
+    ):
         """ASR 无结果时补播一句兜底话术，让设备播完并回到「待命」。
 
         写法照抄 core/handle/intentHandler.py 的 speak_txt()：FIRST+LAST 单独成句。
@@ -200,6 +207,8 @@ class ASRProviderBase(ABC):
                 return
             if conn.stop_event.is_set():
                 return
+            if not reason and self._skip_empty_fallback(conn, audio_frames):
+                return
             if reason:
                 phrase = conn.config.get(
                     "asr_failure_reply", "识别服务暂时不可用，请稍后再试"
@@ -212,6 +221,35 @@ class ASRProviderBase(ABC):
             self._speak_fallback_phrase(conn, phrase)
         except Exception as e:
             logger.bind(tag=TAG).warning(f"ASR兜底播报失败: {e}")
+
+    def _skip_empty_fallback(
+        self, conn: "ConnectionHandler", audio_frames: Optional[int]
+    ) -> bool:
+        """空识别（reason 为空）是否该跳过兜底。
+
+        只对**空结果**分支生效：reason 非空说明后端故障，那句「识别服务暂时
+        不可用」必须播。两种豁免：
+
+        1. 刚被唤醒——唤醒回应还在播，设备把这段音频当一次 listen 上来，
+           识别为空是正常的，再补一句「没听清」就成了自问自答；
+        2. 音频过短——帧长 60ms，默认 8 帧≈0.5s。误触/半个字根本不构成一次
+           提问，不该被当作识别失败。
+        """
+        if getattr(conn, "just_woken_up", False):
+            logger.bind(tag=TAG).info("唤醒后首段空识别，跳过兜底")
+            return True
+        if audio_frames is None:
+            return False
+        try:
+            min_frames = int(conn.config.get("asr_empty_min_frames", 8))
+        except (TypeError, ValueError):
+            min_frames = 8
+        if min_frames > 0 and audio_frames < min_frames:
+            logger.bind(tag=TAG).info(
+                f"空识别音频仅 {audio_frames} 帧（<{min_frames}），跳过兜底"
+            )
+            return True
+        return False
 
     def _speak_fallback_phrase(self, conn: "ConnectionHandler", phrase: str):
         """按 FIRST+LAST 单句播一条兜底话术（供 ASR 空结果兜底与 listen 超时兜底复用）。

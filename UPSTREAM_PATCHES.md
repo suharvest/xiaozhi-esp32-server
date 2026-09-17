@@ -261,6 +261,31 @@ OVS 发一条 TTS 流（抢 5 次会话槽）并把帧塞进播放队列。
 
 **Verify after merge**: `grep -n "_collect_frames\|def to_tts" core/providers/tts/openvoicestream_tts.py` ≥ 3 hits。
 
+### B1g. 唤醒后首段与极短音频的空识别不播兜底（2026-09-17）
+
+**What**: `core/providers/asr/base.py` + `config.yaml`（新键
+`asr_empty_min_frames`，默认 8）。
+
+**Why**: B1b 的空结果兜底对两类非提问音频误触发：唤醒回应播放期间设备上传的
+那段音频（`just_woken_up`）、以及误触产生的半秒不到的音频。两者识别为空是正常
+的，补播「没听清」变成自问自答。
+
+**How**: `handle_voice_stop` 的 `text_len == 0` 分支把 `len(asr_audio_task)` 作为
+`audio_frames` 传给 `_maybe_speak_asr_fallback`（保留默认值 `None`，对既有调用
+兼容）。新增 `_skip_empty_fallback()`，**仅在 `reason` 为空**（即真·空识别，
+非后端故障）时生效：`conn.just_woken_up` 为 True → 跳过；
+`audio_frames < asr_empty_min_frames`（帧长 60ms，8 帧≈0.5s）→ 跳过。
+两种跳过各打一条 INFO。`reason` 非空仍播 `asr_failure_reply`。
+
+**Config**: `asr_empty_min_frames: 8`（设 0 关闭该豁免）。
+
+**Tests**: `main/xiaozhi-server/test/test_asr_empty_guard.py`（a–d）：
+(a) `just_woken_up=True` + 空文本不入队；(b) 3 帧 + 空文本不入队；
+(c) 20 帧 + 空文本入队「没听清」；(d) `reason="timeout"` 即使 3 帧仍播
+「识别服务暂时不可用」。
+
+**Verify after merge**: `grep -n "_skip_empty_fallback\|asr_empty_min_frames" core/providers/asr/base.py config.yaml` ≥ 3 hits。
+
 > **SUPERSEDED — VAD ONNX patch (commit `0ad7cf4a`).** We used to carry a
 > `core/providers/vad/silero_onnx_wrapper.py` shim so Silero VAD ran on
 > onnxruntime instead of torch. Upstream has since rewritten
