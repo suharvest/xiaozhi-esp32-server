@@ -136,6 +136,41 @@ input_too_long 裁剪重试/清空兜底；(f) 裁剪协议完整性；(g) 兜�
 `grep -n "tool_result_raw_turns" config.yaml` present；
 `grep -n "_last_fallback_ts" core/providers/asr/base.py` present。
 
+### B1c. Listen-timeout fallback（listen 超时兑底）(2026-09-16)
+
+**What**: `core/providers/asr/base.py` +
+`core/handle/textHandler/listenMessageHandler.py` + `config.yaml`. After a
+`listen start`, if for N seconds (default 15) the server gets **no ASR text
+and no voice_stop** (device WiFi jitter / firmware hang → audio never uploaded,
+so `handle_voice_stop()` is never reached), the server now proactively speaks
+a fallback phrase (FIRST+LAST, reusing the B1b speech path, now extracted into
+`_speak_fallback_phrase()` — B1b behavior/logic unchanged) and resets this
+round's audio state, so the device finishes playback and returns to standby
+instead of hanging with a red LED.
+
+**Hook points**: `ListenTextMessageHandler.handle()` state=="start" →
+`conn.asr._start_listen_timeout(conn)` (asyncio task, ref kept on
+`conn._listen_timeout_task`, cancellable); state=="stop" →
+`_cancel_listen_timeout`; `ASRProviderBase.handle_voice_stop()` entry →
+`_cancel_listen_timeout` (covers ASR text for both stream & non-stream
+providers since both funnel through it). New listen start cancels the old
+timer; `client_abort` / `stop_event` are guarded inside the waiter.
+
+**Config** (defaults, no field change required): `asr_listen_timeout_enabled`
+(true), `asr_listen_timeout_sec` (15), `asr_listen_timeout_reply` (defaults to
+`asr_empty_reply`, i.e. "没听清，请再说一遍"; explicit empty string = silent).
+Feature off → behavior identical to pre-patch.
+
+**Log**: WARNING containing the fixed grep marker `listen 超时兜底` plus
+session_id, waited seconds, audio-frame count received so far.
+
+**Rollback**: `git checkout -- main/xiaozhi-server/core/providers/asr/base.py
+main/xiaozhi-server/core/handle/textHandler/listenMessageHandler.py` (and
+revert the config.yaml block), or runtime-disable by writing
+`asr_listen_timeout_enabled: false` into `data/.config.yaml` and restarting.
+
+**Verify after merge**: `grep -n "_start_listen_timeout\|_cancel_listen_timeout\|_listen_timeout_waiter" core/providers/asr/base.py` ≥ 6 hits; `grep -n "_start_listen_timeout" core/handle/textHandler/listenMessageHandler.py` = 1 hit; `grep -n "listen 超时兜底" core/providers/asr/base.py` present; `grep -n "asr_listen_timeout" config.yaml` = 3 keys.
+
 > **SUPERSEDED — VAD ONNX patch (commit `0ad7cf4a`).** We used to carry a
 > `core/providers/vad/silero_onnx_wrapper.py` shim so Silero VAD ran on
 > onnxruntime instead of torch. Upstream has since rewritten
