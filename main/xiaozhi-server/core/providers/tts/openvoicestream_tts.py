@@ -139,6 +139,17 @@ class TTSProvider(TTSProviderBase):
         # close() 后不再启动/继续任何在途流
         self._closed = False
 
+        # ---- 非流式合成（to_tts）的帧采集 ----
+        # base.to_tts 期望 text_to_speak 返回音频字节，而本 provider 的
+        # text_to_speak 是流式的（返回 bool，音频经 handle_opus 进播放队列）。
+        # 唤醒词回应缓存（helloHandle.wakeupWordsResponse）走 to_tts，不覆写
+        # 就会每次失败 5 次，并且每次都真的向 OVS 发一条流、把帧塞进播放队列。
+        # 采集期间 handle_opus 改为把帧收进这个列表，不进 tts_audio_queue。
+        self._collect_frames = None
+        # 采集与流式播放共用同一个 provider 实例（各自在自己的线程里跑
+        # asyncio.run），没有锁的话两条流的帧会混进同一个列表。
+        self._synth_lock = threading.Lock()
+
         # Lazily created when we know the actual sample rate
         self.opus_encoder = None
         self.opus_sample_rate = None
@@ -274,7 +285,8 @@ class TTSProvider(TTSProviderBase):
         try:
             text = MarkdownCleaner.clean_markdown(text)
             try:
-                succeeded = asyncio.run(self.text_to_speak(text, is_last))
+                with self._synth_lock:
+                    succeeded = asyncio.run(self.text_to_speak(text, is_last))
             except Exception as e:
                 logger.bind(tag=TAG).warning(
                     f"TTS generation failed: {text}, error: {e}"
@@ -294,11 +306,50 @@ class TTSProvider(TTSProviderBase):
         finally:
             return None
 
+    def to_tts(self, text):
+        """非流式合成：把整段音频采集成 opus 帧列表返回。
+
+        契约与 ``base.TTSProviderBase.to_tts`` 一致——返回 opus 帧 bytes 列表，
+        调用方（helloHandle.wakeupWordsResponse）用
+        ``opus_datas_to_wav_bytes(frames, sample_rate=conn.sample_rate)`` 解码。
+        失败返回 None（调用方对 None 直接 return），不抛。
+        """
+        frames = []
+        succeeded = False
+        try:
+            cleaned = MarkdownCleaner.clean_markdown(text)
+            with self._synth_lock:
+                self._collect_frames = frames
+                try:
+                    succeeded = asyncio.run(self.text_to_speak(cleaned, is_last=False))
+                finally:
+                    self._collect_frames = None
+        except Exception as e:
+            logger.bind(tag=TAG).warning(f"非流式语音生成失败: {text}，错误: {e}")
+            return None
+        if succeeded and frames:
+            logger.bind(tag=TAG).info(
+                f"非流式语音生成成功: {text}，{len(frames)} 帧"
+            )
+            return frames
+        logger.bind(tag=TAG).warning(
+            f"非流式语音生成无音频: {text}，succeeded={succeeded}, frames={len(frames)}"
+        )
+        return None
+
+    def handle_opus(self, opus_data: bytes):
+        """采集模式下收帧不入播放队列；其余情况沿用 base 行为。"""
+        collect = getattr(self, "_collect_frames", None)
+        if collect is not None:
+            collect.append(opus_data)
+            return
+        return super().handle_opus(opus_data)
+
     def _auth_headers(self) -> dict:
         """OVS 的鉴权头。OVS_API_KEYS 未启用时为空。"""
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
 
-    def _make_stop_checker(self, sid):
+    def _make_stop_checker(self, sid, ignore_round=False):
         """返回一个「这条流是否该停」的判定函数。
 
         都是简单 bool 读，跨线程直接读即可，不需要锁。
@@ -315,7 +366,9 @@ class TTSProvider(TTSProviderBase):
             stop_event = getattr(conn, "stop_event", None)
             if stop_event is not None and stop_event.is_set():
                 return True
-            if sid and sid != getattr(conn, "sentence_id", sid):
+            # 采集模式（to_tts）与对话轮次无关：此时的 sentence_id 只是上一轮
+            # 的残留，拿它做换轮判定会让唤醒词缓存合成永远被判为「过期」。
+            if not ignore_round and sid and sid != getattr(conn, "sentence_id", sid):
                 return True
             return False
 
@@ -455,7 +508,8 @@ class TTSProvider(TTSProviderBase):
         # 放手——OVS 只有 2 个全局会话槽，一条合成完才释放意味着下一轮开口时
         # 槽还被占着，直接 429。
         sid = self.current_sentence_id
-        _stopped = self._make_stop_checker(sid)
+        collecting = getattr(self, "_collect_frames", None) is not None
+        _stopped = self._make_stop_checker(sid, ignore_round=collecting)
 
         if _stopped():
             logger.bind(tag=TAG).info("TTS aborted before request (stale round)")
@@ -466,9 +520,10 @@ class TTSProvider(TTSProviderBase):
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 resp = await self._post_with_retry(session, payload, stopped=_stopped)
                 if resp is None:
-                    if _stopped():
+                    if _stopped() or collecting:
                         # 中止路径：收尾由上层（abort / 新一轮）负责，这里再补
                         # 一个 LAST 只会给已经作废的轮次多推一帧。
+                        # 采集模式下这条流根本不属于任何播放轮次，更不该入队。
                         return False
                     self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
                     return False
@@ -477,11 +532,13 @@ class TTSProvider(TTSProviderBase):
                         logger.bind(tag=TAG).error(
                             f"TTS request failed: {resp.status}, {await resp.text()}"
                         )
-                        self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
+                        if not collecting:
+                            self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
                         return False
 
                     self.pcm_buffer.clear()
-                    self.tts_audio_queue.put((SentenceType.FIRST, [], text, self.current_sentence_id))
+                    if not collecting:
+                        self.tts_audio_queue.put((SentenceType.FIRST, [], text, self.current_sentence_id))
 
                     # ---- Parse leading 4-byte LE sample rate header ----
                     header_buf = bytearray()
@@ -564,7 +621,8 @@ class TTSProvider(TTSProviderBase):
                 self.pcm_buffer.clear()
                 return False
             logger.bind(tag=TAG).error(f"TTS request exception: {e}")
-            self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
+            if not collecting:
+                self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
             return False
 
     async def close(self):

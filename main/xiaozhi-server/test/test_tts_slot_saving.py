@@ -20,7 +20,10 @@
   (e) 空文本 LAST 只收尾、不发 TTS；
   (f) 在途流可中止：client_abort / stop_event / sentence_id 换轮 / close()
       四种都在 <1s 内退出，且中止后不再往音频队列里塞东西；
-  (g) 连续 429 时 _post_with_retry 总耗时 ≤3.5s 且返回 None。
+  (g) 连续 429 时 _post_with_retry 总耗时 ≤3.5s 且返回 None；
+  (h) to_tts 采集：返回非空 opus 帧列表，且 tts_audio_queue 保持为空
+      （没有 FIRST/LAST 混进播放队列）；
+  (i) 采集期间 current_sentence_id != conn.sentence_id 不导致中止。
 """
 import asyncio
 import os
@@ -104,6 +107,8 @@ def make_provider(**over):
     p.retry_max_delay = 1.5
     p.retry_budget_seconds = 3.0
     p._closed = False
+    p._collect_frames = None
+    p._synth_lock = threading.Lock()
     p.conn = FakeConn()
     for k, v in over.items():
         setattr(p, k, v)
@@ -393,6 +398,78 @@ def test_g_retry_budget():
         ovs.aiohttp = real_aiohttp
 
 
+# --------------------------------------------------------------------------
+# h / i：to_tts 非流式采集
+# --------------------------------------------------------------------------
+class FiniteContent(FakeContent):
+    """吐完 chunks 就 EOF（FakeContent 是吐完后永久阻塞）。"""
+
+    async def readany(self):
+        if self.chunks:
+            return self.chunks.pop(0)
+        return b""
+
+
+class FiniteResp(FakeResp):
+    def __init__(self, chunks, status=200, headers=None):
+        super().__init__(chunks, status=status, headers=headers)
+        self.content = FiniteContent(chunks)
+
+
+def _collect_setup(p):
+    """4 字节采样率头 + 2 帧 PCM 的假响应，并把编码器换成 FakeEncoder。"""
+    import struct
+
+    enc = FakeEncoder()
+    p._ensure_encoder = lambda sr, _p=p, _e=enc: setattr(_p, "opus_encoder", _e)
+    # frame_bytes = 16000 * 1 * 60 / 1000 * 2 = 1920
+    chunks = [struct.pack("<I", 16000) + b"\x01" * 1920, b"\x02" * 1920]
+    _install_fake_aiohttp(lambda: FiniteResp(chunks))
+    return enc
+
+
+def test_h_to_tts_collect():
+    real_aiohttp = ovs.aiohttp
+    try:
+        p = make_provider()
+        sid = uuid.uuid4().hex
+        p.current_sentence_id = sid
+        p.conn.sentence_id = sid
+        enc = _collect_setup(p)
+
+        frames = p.to_tts("我在这里哦")
+
+        assert isinstance(frames, list), f"to_tts 应返回帧列表，得到 {type(frames)}"
+        assert len(frames) >= 2, f"采集到的帧太少: {len(frames)}"
+        assert all(isinstance(f, bytes) for f in frames), frames[:2]
+        assert enc.frames >= 2, enc.frames
+        assert p.tts_audio_queue.empty(), (
+            f"采集不该往播放队列入队，队列里有 {p.tts_audio_queue.qsize()} 项"
+        )
+        assert p._collect_frames is None, "采集结束后 _collect_frames 未复位"
+        print(f"(h) to_tts 采集到 {len(frames)} 帧、播放队列为空  ✓")
+    finally:
+        ovs.aiohttp = real_aiohttp
+
+
+def test_i_collect_ignores_round():
+    real_aiohttp = ovs.aiohttp
+    try:
+        p = make_provider()
+        # 采集与对话轮次无关：上一轮的 sentence_id 残留不应把这条流判为过期
+        p.current_sentence_id = "OLD-ROUND"
+        p.conn.sentence_id = "NEW-ROUND"
+        _collect_setup(p)
+
+        frames = p.to_tts("我在这里哦")
+
+        assert frames, "sentence_id 换轮把采集误判为中止了"
+        assert p.tts_audio_queue.empty(), p.tts_audio_queue.qsize()
+        print("(i) 采集期间 sentence_id 不匹配仍正常完成  ✓")
+    finally:
+        ovs.aiohttp = real_aiohttp
+
+
 if __name__ == "__main__":
     test_a_first_sentence_early()
     test_b_threshold()
@@ -401,4 +478,6 @@ if __name__ == "__main__":
     test_e_empty_last()
     test_f_abort_inflight()
     test_g_retry_budget()
+    test_h_to_tts_collect()
+    test_i_collect_ignores_round()
     print("\n全部通过 ✓")
