@@ -229,6 +229,38 @@ ASR 拿不到槽 → 走 B1b 兜底播「识别服务暂时不可用」→ 设�
 
 **Verify after merge**: `grep -n "_make_stop_checker\|subsequent_sentence_min_chars\|retry_budget_seconds" core/providers/tts/openvoicestream_tts.py` ≥ 3 hits。
 
+### B1f. OVS TTS 补非流式 `to_tts()`（唤醒词回应缓存，2026-09-17）
+
+**What**: `core/providers/tts/openvoicestream_tts.py`。新增 `to_tts()` 与
+`handle_opus()` 覆写，把一次合成的 opus 帧采集成列表返回，不经播放队列。
+
+**Why**: `core/handle/helloHandle.py:147` 的 `wakeupWordsResponse` 每次唤醒且
+缓存超过 10s 就 `await asyncio.to_thread(conn.tts.to_tts, text)`。
+`core/providers/tts/base.py:218` 的 `to_tts` 调 `text_to_speak(text, None)` 并
+期望拿到音频字节，而本 provider 的 `text_to_speak` 是流式的（返回 bool，音频经
+`handle_opus` 推进 `tts_audio_queue`）→ base 抛
+`a bytes-like object is required, not 'bool'` 并重试 5 次；每次重试都真的向
+OVS 发一条 TTS 流（抢 5 次会话槽）并把帧塞进播放队列。
+
+**How**:
+- `__init__` 新增 `self._collect_frames = None` 与 `self._synth_lock`。
+- `to_tts(text)`：持锁置 `_collect_frames`，`asyncio.run(text_to_speak(...))`，
+  finally 复位；成功且帧非空返回 opus 帧 bytes 列表（与 base `to_tts` 契约一致，
+  调用方用 `opus_datas_to_wav_bytes(frames, sample_rate=conn.sample_rate)` 解码），
+  否则返回 None 且不抛。
+- `handle_opus`：采集模式下把帧 append 进列表并返回，否则走 `super()`。
+- `text_to_speak`：采集模式下不往 `tts_audio_queue` put FIRST/LAST；
+  `_make_stop_checker(sid, ignore_round=True)` 跳过 sentence_id 换轮判定
+  （采集与对话轮次无关），仍尊重 `_closed` / `stop_event` / `client_abort`。
+- `to_tts_single_stream` 的 `asyncio.run(...)` 同样持 `_synth_lock`，避免采集期间
+  另一条流的帧混进列表。
+
+**Tests**: `main/xiaozhi-server/test/test_tts_slot_saving.py` 新增 (h)(i)：
+(h) `to_tts` 返回非空帧列表且 `tts_audio_queue` 为空；
+(i) `current_sentence_id != conn.sentence_id` 时采集仍正常完成。
+
+**Verify after merge**: `grep -n "_collect_frames\|def to_tts" core/providers/tts/openvoicestream_tts.py` ≥ 3 hits。
+
 > **SUPERSEDED — VAD ONNX patch (commit `0ad7cf4a`).** We used to carry a
 > `core/providers/vad/silero_onnx_wrapper.py` shim so Silero VAD ran on
 > onnxruntime instead of torch. Upstream has since rewritten
