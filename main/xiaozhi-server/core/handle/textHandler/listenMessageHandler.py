@@ -35,12 +35,17 @@ class ListenTextMessageHandler(TextMessageHandler):
         if msg_json["state"] == "start":
             # 设备从播放模式切回录音模式,清除所有音频状态和缓冲区
             conn.reset_audio_states()
+            # 起 listen 超时兑底定时表：N 秒内无 ASR 文本也无 voice_stop 则服务端主动补播
+            if conn.asr is not None:
+                conn.asr._start_listen_timeout(conn)
         elif msg_json["state"] == "stop":
             # 收到stop但asr未初始化，跳过处理
             if conn.asr is None:
                 return
 
             conn.client_voice_stop = True
+            # 收到 voice_stop，取消 listen 超时兑底定时器
+            conn.asr._cancel_listen_timeout(conn)
             if conn.asr.interface_type == InterfaceType.STREAM:
                 # 流式模式下，发送结束请求
                 asyncio.create_task(conn.asr._send_stop_request())

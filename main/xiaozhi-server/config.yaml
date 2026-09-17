@@ -77,6 +77,14 @@ asr_fallback_enabled: true
 asr_failure_reply: "识别服务暂时不可用，请稍后再试"
 # ASR 正常工作但没识别出内容时播报
 asr_empty_reply: "没听清，请再说一遍"
+# listen 超时兑底：设备进入聆听态后 N 秒内既无 ASR 文本也无 voice_stop
+#（如 WiFi 抖动/固件卡死导致音频根本没上传，服务端永远不会走到
+# handle_voice_stop），服务端主动补播一句并复位本轮状态，避免设备亮红灯卡死。
+asr_listen_timeout_enabled: true
+# 超时秒数，默认 15 秒，设为 0 或负数等同关闭
+asr_listen_timeout_sec: 15
+# 超时话术；不配置则默认沿用 asr_empty_reply；显式空字符串 = 超时不播报
+# asr_listen_timeout_reply: "没听清，请再说一遍"
 # 开启唤醒词加速
 enable_wakeup_words_response_cache: true
 # 开场是否回复唤醒词
