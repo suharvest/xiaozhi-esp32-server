@@ -95,6 +95,11 @@ asr_fallback_enabled: true
 asr_failure_reply: "识别服务暂时不可用，请稍后再试"
 # ASR 正常工作但没识别出内容时播报
 asr_empty_reply: "没听清，请再说一遍"
+# 空识别兜底的最小音频帧数（帧长 60ms，8 帧≈0.5s）。不足该帧数的空识别视为
+# 误触而非提问，不播 asr_empty_reply；设为 0 关闭该豁免。
+# 另：刚被唤醒（just_woken_up）时的首段空识别也一律不播——那段音频是唤醒
+# 回应自己的回声。两条豁免都只作用于空结果，后端故障仍播 asr_failure_reply。
+asr_empty_min_frames: 8
 # listen 超时兑底：设备进入聆听态后 N 秒内既无 ASR 文本也无 voice_stop
 #（如 WiFi 抖动/固件卡死导致音频根本没上传，服务端永远不会走到
 # handle_voice_stop），服务端主动补播一句并复位本轮状态，避免设备亮红灯卡死。
