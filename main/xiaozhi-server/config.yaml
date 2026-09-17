@@ -69,6 +69,24 @@ tool_call_timeout: 30
 # 拦不住）。这句话由服务端补发，不进对话历史。
 tool_call_filler: "正在查询。"
 
+# 工具结果进 LLM 上下文前的压缩（治 EdgeLLM 8192 上限被工具大 JSON 撑爆）。
+# 保真窗口：最近 N 轮（user→assistant 为一轮）内的 tool 结果逐字保留，
+# 窗口外的历史 tool 结果一律压缩（保留 ok/say/message + 候选摘要：
+# 名字+库存+库位）。写操作（stock_in/stock_out）的 say 任何情况下逐字保留。
+# 上报/记忆路径不受影响（enqueue_tool_report 仍收到原始结果）。
+tool_result_raw_turns: 2
+# 窗口内单条 tool 结果的宽松上限（字）：超限时只剥离巨型数组，say 全文保留
+tool_result_latest_max_chars: 4000
+# 仅作用于窗口外历史 tool 结果的长度上限（字）
+tool_result_max_chars: 600
+# 历史候选摘要最多保留条数
+tool_result_candidate_limit: 5
+# LLM 异常（非上下文超限）时的播报话术；不配置则沿用 system_error_response
+# llm_error_reply: "主人，小智现在有点忙，我们稍后再试吧。"
+# 上下文超限（input_too_long）裁剪重试仍失败时，清空会话上下文并播报的话术；
+# 显式空字符串 = 不播
+llm_context_overflow_reply: "信息太多，我先清一下，请再说一遍"
+
 # ASR 无结果时的兑底播报。ASR 后端不可达/异常/超时/识别为空时，服务端补播
 # 一句话让设备播完回到「待命」，而不是卡在「聆听中」只能断电。
 # 设为 false 关闭兑底播报；话术显式设为空字符串则对应分支不播。
