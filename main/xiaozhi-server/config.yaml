@@ -1267,4 +1267,13 @@ TTS:
     pitch: null
     language: null
     timeout: 30
+    # OVS 会话池只有 2 个全局槽（ASR 1 + TTS 1），每句话一条 HTTP 流各占 1 个。
+    # 首句之后按最小字数合并分段：一段回答从 4~8 条流降到 1~2 条，争抢次数同比下降。
+    # 首句不受影响（仍走 first_sentence_max_chars 规则），首音频延迟不变。
+    subsequent_sentence_min_chars: 32
+    # 429（too_many_sessions）重试收敛：槽满时最多重试 2 次、单次退避 ≤1.5s、
+    # 整个重试阶段 ≤3.0s。超出即放弃这一句，交回上层兜底，而不是把整轮堵死。
+    max_retries: 2
+    retry_max_delay: 1.5
+    retry_budget_seconds: 3.0
     output_dir: tmp/
