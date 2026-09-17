@@ -68,6 +68,15 @@ tool_call_timeout: 30
 # 期间会连续数秒收不到音频而主动断连（服务端 close_connection_no_voice_time
 # 拦不住）。这句话由服务端补发，不进对话历史。
 tool_call_filler: "正在查询。"
+
+# ASR 无结果时的兑底播报。ASR 后端不可达/异常/超时/识别为空时，服务端补播
+# 一句话让设备播完回到「待命」，而不是卡在「聆听中」只能断电。
+# 设为 false 关闭兑底播报；话术显式设为空字符串则对应分支不播。
+asr_fallback_enabled: true
+# ASR 后端不可达/异常/超时无文本时播报
+asr_failure_reply: "识别服务暂时不可用，请稍后再试"
+# ASR 正常工作但没识别出内容时播报
+asr_empty_reply: "没听清，请再说一遍"
 # 开启唤醒词加速
 enable_wakeup_words_response_cache: true
 # 开场是否回复唤醒词
