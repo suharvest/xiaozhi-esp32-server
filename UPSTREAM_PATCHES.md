@@ -124,8 +124,8 @@ EdgeLLM 上下文上限 8192（可用输入 ~7064 token）不可上调，历史�
 `tool_result_candidate_limit: 5`、`llm_context_overflow_reply`
 （`llm_error_reply` 注释掉，默认沿用 system_error_response）。
 
-**Tests**: `main/xiaozhi-server/tmp/test_context_overflow.py`（容器内 stdin
-运行）：(a) 窗口外历史压缩到上限内且含候选摘要；(b) 窗口内逐字保留、
+**Tests**: `main/xiaozhi-server/test/test_context_overflow.py`（pytest 或容器内
+stdin 运行）：(a) 窗口外历史压缩到上限内且含候选摘要；(b) 窗口内逐字保留、
 超限只剥巨型数组；(c) `enqueue_tool_report` 收到原始串；(d)(e)
 input_too_long 裁剪重试/清空兜底；(f) 裁剪协议完整性；(g) 兜底 8 秒去重。
 
@@ -163,6 +163,11 @@ Feature off → behavior identical to pre-patch.
 
 **Log**: WARNING containing the fixed grep marker `listen 超时兜底` plus
 session_id, waited seconds, audio-frame count received so far.
+
+**Tests**: `main/xiaozhi-server/test/test_listen_timeout.py`（pytest 或容器内
+stdin 运行）：(a) 零音频零文本到点播兜底话术（FIRST+LAST）+ 「listen 超时兜底」
+WARNING + 本轮状态复位；(b) 窗口内到达 voice_stop/ASR 文本 → 定时器取消、不播；
+(c) `client_abort=True` → 不播。
 
 **Rollback**: `git checkout -- main/xiaozhi-server/core/providers/asr/base.py
 main/xiaozhi-server/core/handle/textHandler/listenMessageHandler.py` (and
@@ -210,8 +215,8 @@ ASR 拿不到槽 → 走 B1b 兜底播「识别服务暂时不可用」→ 设�
 `subsequent_sentence_min_chars: 32`、`max_retries: 2`、`retry_max_delay: 1.5`、
 `retry_budget_seconds: 3.0`。
 
-**Tests**: `main/xiaozhi-server/tmp/test_tts_slot_saving.py`（a–g，容器内 stdin
-运行）：(a) 首句仍按 base 规则出；(b) 后续句不足 32 字不发流；(c) 攒够即发；
+**Tests**: `main/xiaozhi-server/test/test_tts_slot_saving.py`（a–g，pytest 或
+容器内 stdin 运行）：(a) 首句仍按 base 规则出；(b) 后续句不足 32 字不发流；(c) 攒够即发；
 (d) LAST 排空余文且 `processed_chars` 不越界；(e) 换轮/abort 清缓冲；
 (f) `stopped()` 命中时中途退出且不推 LAST；(g) 重试预算耗尽返回 None。
 
