@@ -12,17 +12,20 @@
        docker exec -i -w /opt/xiaozhi-esp32-server xiaozhi-server \
            python3 - < main/xiaozhi-server/test/test_listen_timeout.py
 
-覆盖三例：
+覆盖五例：
   (a) listen start 后零音频零文本 → N 秒后队列出现兜底话术（FIRST+LAST），
       并出现含「listen 超时兜底」的 WARNING；
   (b) N 秒内到达 voice_stop/ASR 文本（handle_voice_stop 被调用）→ 到点不播；
-  (c) client_abort=True → 不播。
+  (c) client_abort=True → 不播；
+  (d) 到点时音频仍在到达（1s 前刚收到帧）→ 不触发，顺延；
+  (e) 顺延后连续 quiet 秒无新帧 → 触发一次（且只一次）。
 """
 import asyncio
 import os
 import queue
 import sys
 import tempfile
+import time
 import uuid
 
 
@@ -92,6 +95,10 @@ class FakeConn:
         self.voiceprint_provider = None
         self.tts = FakeTTS()
         self.reset_count = 0
+        self.client_listen_mode = "manual"
+        self.client_have_voice = False
+        self.client_voice_stop = False
+        self._last_audio_frame_ts = None
 
     def reset_audio_states(self):
         self.reset_count += 1
@@ -166,6 +173,57 @@ async def _case_c():
     print("(c) client_abort=True → 不播  ✓")
 
 
+async def _case_d_defers_while_audio_arriving():
+    """到点时 1s 前还有帧 → 不触发，顺延等一个 quiet 窗口。
+
+    现场日志：`已等待=15s, 收到音频帧数=212` —— 用户连续说了 12.7s，VAD 没判停，
+    硬计时到点插播「没听清」，5s 后 ASR 才把长句吐出来。
+    """
+    conn = FakeConn({
+        "asr_listen_timeout_sec": 0.5,
+        "asr_listen_timeout_quiet_sec": 1.0,
+        "asr_listen_timeout_max_sec": 10,
+    })
+    asr = FakeASR()
+    asr._start_listen_timeout(conn)
+    # 持续喂帧，跨过 0.5s 到点
+    for _ in range(9):
+        await asr.receive_audio(conn, b"\x00" * 1920, True)
+        await asyncio.sleep(0.1)
+    # t≈0.9s：到点时刻早已过，但最后一帧距今仅 ~0.1s → 必须还没播
+    items = drain(conn.tts.tts_text_queue)
+    assert not items and not conn.tts.spoken, f"音频仍在到达时不应兜底: {items} {conn.tts.spoken}"
+    assert not any(MARKER in m for m in captured), "音频仍在到达时不应触发兜底 WARNING"
+    assert conn.asr_audio, "帧应已缓存"
+    asr._cancel_listen_timeout(conn)
+    print("(d) 到点时音频仍在到达 → 顺延不播  ✓")
+
+
+async def _case_e_fires_after_quiet():
+    """顺延后连续 quiet 秒无新帧 → 触发一次"""
+    conn = FakeConn({
+        "asr_listen_timeout_sec": 0.5,
+        "asr_listen_timeout_quiet_sec": 1.0,
+        "asr_listen_timeout_max_sec": 10,
+    })
+    asr = FakeASR()
+    asr._start_listen_timeout(conn)
+    for _ in range(9):
+        await asr.receive_audio(conn, b"\x00" * 1920, True)
+        await asyncio.sleep(0.1)
+    # t≈0.9s：停止喂帧，等一个 quiet 窗口（1.0s）+ 余量
+    await asyncio.sleep(1.6)
+    items = drain(conn.tts.tts_text_queue)
+    types = [i.sentence_type for i in items]
+    assert types.count(SentenceType.FIRST) == 1, f"应只播一次: {types}"
+    assert SentenceType.LAST in types, types
+    assert conn.tts.spoken == ["没听清，请再说一遍"], conn.tts.spoken
+    warns = [m for m in captured if MARKER in m]
+    assert len(warns) == 1, warns
+    assert "最后一帧距今=" in warns[0], warns[0]
+    print("(e) 顺延后连续 quiet 无帧 → 触发一次  ✓")
+
+
 # 注意：每个用例进入前必须“清空全部”，不能按进入前的长度切片删除
 #（进入前长度通常为 0，del captured[:0] 是空操作，会把上一例的 WARNING
 # 留在列表里，导致下一例假失败 —— 已踩过）。
@@ -184,8 +242,20 @@ def test_c_client_abort_skips_fallback():
     asyncio.run(_case_c())
 
 
+def test_d_defers_while_audio_arriving():
+    captured.clear()
+    asyncio.run(_case_d_defers_while_audio_arriving())
+
+
+def test_e_fires_after_quiet_window():
+    captured.clear()
+    asyncio.run(_case_e_fires_after_quiet())
+
+
 if __name__ == "__main__":
     test_a_timeout_speaks_fallback()
     test_b_voice_stop_cancels_timer()
     test_c_client_abort_skips_fallback()
+    test_d_defers_while_audio_arriving()
+    test_e_fires_after_quiet_window()
     print("\n全部通过 ✓")
