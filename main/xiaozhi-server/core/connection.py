@@ -98,6 +98,10 @@ class ConnectionHandler:
         self._pending_tool_answer = False
         self._last_tool_result_text = None
 
+        # LLM 前缀缓存遥测：上一次调用的前缀指纹与工具数（见 _note_llm_prefix）
+        self._llm_prefix_last_md5 = None
+        self._llm_prefix_last_tools = None
+
         self.need_bind = False  # 是否需要绑定设备
         self.bind_completed_event = asyncio.Event()
         self.bind_code = None  # 绑定设备的验证码
@@ -1130,6 +1134,9 @@ class ConnectionHandler:
             self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
             return None
 
+        # 前缀指纹变化告警：直接回答「这一轮为什么没命中 EdgeLLM 的 KV 前缀缓存」
+        self._note_llm_prefix(messages_for_llm, functions)
+
         # 处理流式响应（含 input_too_long 自动裁剪重试与异常兜底播报）
         try:
             stream = self._run_llm_stream_with_overflow_retry(
@@ -1380,6 +1387,28 @@ class ConnectionHandler:
     # ------------------------------------------------------------------
     # A2/A3 LLM 调用与兜底
     # ------------------------------------------------------------------
+    def _note_llm_prefix(self, messages, functions):
+        """比对本次与上次的前缀指纹，变化时打 INFO。
+
+        EdgeLLM 只缓存开头 system 块（静态 system prompt + tools）的 KV；指纹一变
+        就是整段重新 prefill（实测 9~13s，设备 ~10s 收不到音频就断线）。工具列表
+        分批到达、系统提示词被改写都会让它变，这条日志把「为什么变」摊开。
+        """
+        try:
+            from core.providers.llm.telemetry import compute_prefix_md5
+
+            md5 = compute_prefix_md5(messages, functions)
+            n_tools = len(functions or [])
+            if self._llm_prefix_last_md5 is not None and md5 != self._llm_prefix_last_md5:
+                self.logger.bind(tag=TAG).info(
+                    f"LLM prefix changed: {self._llm_prefix_last_md5}->{md5} "
+                    f"(tools {self._llm_prefix_last_tools}->{n_tools})"
+                )
+            self._llm_prefix_last_md5 = md5
+            self._llm_prefix_last_tools = n_tools
+        except Exception as e:
+            self.logger.bind(tag=TAG).debug(f"前缀指纹记录失败: {e}")
+
     def _invoke_llm(self, messages, functions):
         """按意图类型调用 LLM（流式）。错误可能在调用时或首次迭代时抛出。"""
         if self.intent_type == "function_call" and functions is not None:
