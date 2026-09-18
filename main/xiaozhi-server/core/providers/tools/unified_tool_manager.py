@@ -115,9 +115,21 @@ class ToolManager:
         return list(tools.keys())
 
     def refresh_tools(self):
-        """刷新工具缓存"""
+        """刷新工具缓存。
+
+        工具集变了 = 送给 LLM 的 tools 前缀变了 = EdgeLLM 的 KV 前缀缓存失效。
+        这里顺手去抖触发一次前缀预热，避免下一句真实提问撞上冷前缀（冷前缀实测
+        prefill 9~13s，设备约 10s 收不到音频就断线）。所有工具来源（设备 MCP 分批、
+        MCP 接入点、服务端 MCP、IoT 描述符）都从这个方法过。
+        """
         self._invalidate_cache()
         self.logger.debug("工具缓存已刷新")
+        warm = getattr(self.conn, "_schedule_llm_prefix_warmup", None)
+        if callable(warm):
+            try:
+                warm("tools_changed")
+            except Exception as e:
+                self.logger.debug(f"前缀预热调度失败: {e}")
 
     def get_tool_statistics(self) -> Dict[str, int]:
         """获取工具统计信息"""

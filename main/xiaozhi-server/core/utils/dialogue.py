@@ -134,7 +134,14 @@ class Dialogue:
             voiceprint_config: dict = None,
             current_speaker: str = None,
             max_history_turns: int = None,
+            include_history: bool = True,
     ) -> List[Dict[str, str]]:
+        """组装送给 LLM 的消息。
+
+        ``include_history=False`` 只产出前缀部分（静态 system + few-shot +
+        动态 system），不带任何真实用户/助手消息——给前缀预热用
+        （见 ConnectionHandler._warm_llm_prefix）。
+        """
         # 构建对话
         dialogue = []
 
@@ -211,6 +218,8 @@ class Dialogue:
             dialogue.append({"role": "system", "content": dynamic_part})
 
         # 第四段：实际对话历史（不含 few-shot），先按用户轮数滑窗
+        if not include_history:
+            return dialogue
         actual_messages = [m for m in non_system_messages if not m.is_temporary]
         actual_messages = self._apply_history_window(actual_messages, max_history_turns)
         complete_actual = self._ensure_tool_calls_complete(actual_messages)
