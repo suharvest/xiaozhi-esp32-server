@@ -3,10 +3,15 @@
 import asyncio
 from typing import Dict, Any, TYPE_CHECKING
 
+from config.logger import setup_logging
+
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
 from ..base import ToolType, ToolDefinition, ToolExecutor
 from plugins_func.register import all_function_registry, Action, ActionResponse
+
+TAG = __name__
+logger = setup_logging()
 
 
 class ServerPluginExecutor(ToolExecutor):
@@ -75,6 +80,31 @@ class ServerPluginExecutor(ToolExecutor):
 
         # 合并所有需要的函数
         all_required_functions = list(set(necessary_functions + config_functions))
+
+        # server_plugins_exclude：把不想要的服务端插件摘掉。
+        # 上游把 get_lunar 写死在 necessary_functions 里，配置页上关不掉，工具列表
+        # 每多一个条目就多一段前缀（EdgeLLM 只缓存 system+tools，见 B1h/B1j）。
+        # handle_exit_intent 是退出意图的唯一入口，不允许排除。
+        exclude = self.config.get("server_plugins_exclude") or []
+        if not isinstance(exclude, (list, tuple, set)):
+            exclude = [exclude]
+        excluded = []
+        for name in exclude:
+            name = str(name).strip()
+            if not name:
+                continue
+            if name == "handle_exit_intent":
+                logger.bind(tag=TAG).warning(
+                    "server_plugins_exclude 不允许排除 handle_exit_intent，已忽略"
+                )
+                continue
+            if name in all_required_functions:
+                all_required_functions.remove(name)
+                excluded.append(name)
+        if excluded:
+            logger.bind(tag=TAG).info(
+                f"server_plugins_exclude 已排除服务端插件: {excluded}"
+            )
 
         for func_name in all_required_functions:
             func_item = all_function_registry.get(func_name)

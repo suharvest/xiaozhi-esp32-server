@@ -406,6 +406,33 @@ depth>0 注入不会循环：`direct_answer` 的处理是「流式播报 + 写�
 
 **Verify after merge**: `grep -n "_last_audio_frame_ts" core/providers/asr/base.py` = 4 hits。
 
+### B1m. `server_plugins_exclude`：可排除硬编码必载的 `get_lunar`（2026-09-18）
+
+**What**: `core/providers/tools/server_plugins/plugin_executor.py`、
+**新增** `config/local_overrides.py`、`config/config_loader.py`（1 行 hook +
+1 行 import）+ `config.yaml`（新键 `server_plugins_exclude`，默认 `[]`）。
+
+**Why**: 上游把 `get_lunar` 写死在 `necessary_functions` 里，智控台上关不掉。
+工具列表每多一个条目就多一段前缀 JSON，而 EdgeLLM 只缓存「静态 system + tools」
+这段 KV（见 B1h/B1j）。
+
+**How**: 合并 `necessary_functions + config_functions` 之后，按
+`config["server_plugins_exclude"]` 过滤函数名；`handle_exit_intent` 是退出意图的
+唯一入口，写在排除列表里会被忽略并打 WARNING。
+
+**注意（与本文件 §C 的出入）**：§C 描述的 `config/local_overrides.py` 与
+`get_config_from_api_async()` 里的 hook 在本分支里**并不存在**（现场容器里也没有），
+本节一并补上。白名单目前只有 `server_plugins_exclude` —— 故意不含
+`ASR`/`TTS`/`LLM`/`selected_module`：那几段现在由 manager 管着，放进白名单会让
+网页上的改动失效。
+
+**Config**: `server_plugins_exclude: []`。console（manager-api）模式下这个键要写在
+`data/.config.yaml`，由 `apply_local_overrides()` 合并回 manager 拉来的配置。
+
+**Tests**: `main/xiaozhi-server/test/test_server_plugins_exclude.py`（a–c）。
+
+**Verify after merge**: `grep -n "apply_local_overrides" config/config_loader.py` = 2 hits。
+
 > **SUPERSEDED — VAD ONNX patch (commit `0ad7cf4a`).** We used to carry a
 > `core/providers/vad/silero_onnx_wrapper.py` shim so Silero VAD ran on
 > onnxruntime instead of torch. Upstream has since rewritten
