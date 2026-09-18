@@ -372,6 +372,19 @@ depth>0 注入不会循环：`direct_answer` 的处理是「流式播报 + 写�
 **Verify after merge**: `grep -n "DIRECT_ANSWER_TOOL" core/connection.py` = 2 hits
 （定义 + `_build_llm_functions`）。
 
+### B1k. 前缀变化日志带工具名 diff（2026-09-18）
+
+**What**: `core/connection.py`（`_note_llm_prefix()` + `_llm_function_names()`）。
+
+**Why**: B1h 的 `LLM prefix changed: a->b (tools 29->28)` 只给数量，看不出是哪个
+工具来了或走了；工具来源有三处（内置、设备 MCP、MCP 接入点），数量对不上时靠
+翻别的日志猜。
+
+**How**: 记住上一次的 `function.name` 集合，变化时按集合差打
+`added=[...] removed=[...]`。
+
+**Tests**: `test/test_llm_prefix_warmup.py` (f)。
+
 > **SUPERSEDED — VAD ONNX patch (commit `0ad7cf4a`).** We used to carry a
 > `core/providers/vad/silero_onnx_wrapper.py` shim so Silero VAD ran on
 > onnxruntime instead of torch. Upstream has since rewritten

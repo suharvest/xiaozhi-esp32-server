@@ -101,6 +101,7 @@ class ConnectionHandler:
         # LLM 前缀缓存遥测：上一次调用的前缀指纹与工具数（见 _note_llm_prefix）
         self._llm_prefix_last_md5 = None
         self._llm_prefix_last_tools = None
+        self._llm_prefix_last_tool_names = None
         # LLM 前缀预热（见 _warm_llm_prefix）：去抖任务 + 互斥 + 真实请求计数
         self._llm_prefix_warmup_task = None
         self._llm_prefix_warmup_lock = threading.Lock()
@@ -1509,6 +1510,19 @@ class ConnectionHandler:
         finally:
             self._llm_prefix_warmup_lock.release()
 
+    @staticmethod
+    def _llm_function_names(functions) -> set:
+        """工具名集合，用于前缀变化日志里的 added/removed 差集。"""
+        names = set()
+        for f in functions or []:
+            try:
+                name = (f.get("function") or {}).get("name")
+            except AttributeError:
+                name = None
+            if name:
+                names.add(name)
+        return names
+
     def _note_llm_prefix(self, messages, functions):
         """比对本次与上次的前缀指纹，变化时打 INFO。
 
@@ -1521,13 +1535,19 @@ class ConnectionHandler:
 
             md5 = compute_prefix_md5(messages, functions)
             n_tools = len(functions or [])
+            names = self._llm_function_names(functions)
             if self._llm_prefix_last_md5 is not None and md5 != self._llm_prefix_last_md5:
+                prev = self._llm_prefix_last_tool_names
+                added = sorted(names - prev) if prev is not None else []
+                removed = sorted(prev - names) if prev is not None else []
                 self.logger.bind(tag=TAG).info(
                     f"LLM prefix changed: {self._llm_prefix_last_md5}->{md5} "
-                    f"(tools {self._llm_prefix_last_tools}->{n_tools})"
+                    f"(tools {self._llm_prefix_last_tools}->{n_tools}) "
+                    f"added={added} removed={removed}"
                 )
             self._llm_prefix_last_md5 = md5
             self._llm_prefix_last_tools = n_tools
+            self._llm_prefix_last_tool_names = names
         except Exception as e:
             self.logger.bind(tag=TAG).debug(f"前缀指纹记录失败: {e}")
 

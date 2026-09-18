@@ -20,7 +20,8 @@
   (c) llm_prefix_warmup_enabled=false 时既不调度也不发请求；
   (d) 真实对话进行中（_llm_chat_active>0）跳过预热；
   (e) depth 0 与 depth>0 的 functions 前缀指纹相同，且与预热用的相同
-      （direct_answer 所有深度都注入，工具列表跨轮逐字稳定）。
+      （direct_answer 所有深度都注入，工具列表跨轮逐字稳定）；
+  (f) 前缀变化日志带 added=/removed= 工具名差集。
 """
 import asyncio
 import os
@@ -59,6 +60,11 @@ from core.connection import ConnectionHandler  # noqa: E402
 from core.utils.dialogue import Dialogue, Message  # noqa: E402
 from core.providers.llm.telemetry import compute_prefix_md5  # noqa: E402
 from config.logger import setup_logging  # noqa: E402
+from loguru import logger as loguru_logger  # noqa: E402
+
+# import 完成后（模块内 setup_logging 已跑）再挂捕获 sink
+captured = []
+loguru_logger.add(lambda m: captured.append(str(m)), level="INFO")
 
 REAL_USER_TEXT = "10-8四通还有多少"
 REAL_ASSISTANT_TEXT = "还有 12 个。"
@@ -125,6 +131,7 @@ def make_conn(config=None, llm=None):
     conn._llm_chat_active = 0
     conn._llm_prefix_last_md5 = None
     conn._llm_prefix_last_tools = None
+    conn._llm_prefix_last_tool_names = None
     return conn
 
 
@@ -233,10 +240,37 @@ def test_e_functions_identical_across_depths():
     print("(e) depth 0/1 与预热的 functions 指纹一致  ✓")
 
 
+def test_f_prefix_change_logs_tool_name_diff():
+    conn = make_conn()
+    messages = [{"role": "system", "content": "你是小智。"}]
+    extra = {"type": "function", "function": {"name": "query_price", "description": "查价"}}
+
+    captured.clear()
+    conn._note_llm_prefix(messages, conn._build_llm_functions())
+    assert not any("LLM prefix changed" in m for m in captured), "首次不该报变化"
+
+    conn.func_handler = FakeToolHandler(TOOLS + [extra])
+    conn._note_llm_prefix(messages, conn._build_llm_functions())
+    line = [m for m in captured if "LLM prefix changed" in m]
+    assert len(line) == 1, captured
+    assert "added=['query_price']" in line[0], line[0]
+    assert "removed=[]" in line[0], line[0]
+
+    captured.clear()
+    conn.func_handler = FakeToolHandler(TOOLS)
+    conn._note_llm_prefix(messages, conn._build_llm_functions())
+    line = [m for m in captured if "LLM prefix changed" in m]
+    assert len(line) == 1, captured
+    assert "added=[]" in line[0], line[0]
+    assert "removed=['query_price']" in line[0], line[0]
+    print("(f) 前缀变化日志带工具名 diff  ✓")
+
+
 if __name__ == "__main__":
     test_a_warmup_messages_exclude_real_history()
     test_b_debounce_collapses_three_changes()
     test_c_disabled_does_nothing()
     test_d_skip_while_chat_active()
     test_e_functions_identical_across_depths()
+    test_f_prefix_change_logs_tool_name_diff()
     print("\n全部通过 ✓")
