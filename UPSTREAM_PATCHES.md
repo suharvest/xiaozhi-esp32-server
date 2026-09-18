@@ -286,6 +286,36 @@ OVS 发一条 TTS 流（抢 5 次会话槽）并把帧塞进播放队列。
 
 **Verify after merge**: `grep -n "_skip_empty_fallback\|asr_empty_min_frames" core/providers/asr/base.py config.yaml` ≥ 3 hits。
 
+### B1h. 每次 LLM 调用记录前缀指纹与 TTFT（2026-09-18）
+
+**What**: 新增 `core/providers/llm/telemetry.py`（A 类新文件），
+`core/providers/llm/openai/openai.py` 两个流式方法各加一层包装，
+`core/connection.py` 增加 `_note_llm_prefix()`。
+
+**Why**: 现场 EdgeLLM（J4012, TRT-LLM, OpenAI 兼容）只为「开头 system 块
+（静态 system prompt + tools）」保留 KV 检查点。实测前缀命中时 TTFT 1.3~2.3s，
+前缀失配要整段重新 prefill，**9~13s**，而设备约 10s 收不到音频就断线——2026-09-18
+早上 4 次断线全是冷前缀。要修它，先得有「这轮前缀是什么、为什么变」的证据。
+
+**How**:
+- `compute_prefix_md5(dialogue, functions)` = md5(messages[0] 的 system 内容 +
+  `json.dumps(functions, sort_keys=True)`)[:8]。只取第一条 system（对应
+  `get_llm_dialogue_with_memory()` 的静态段），动态 system（时间/记忆/说话人）
+  本来就每轮变，不进指纹。
+- `instrument_stream()` 透明包住 provider 的生成器：首个**非空** delta
+  （content 或 tool_calls）记 `ttft`，流结束记 `total`，打一条 INFO
+  `LLM call: prefix=<md5> tools=<n> msgs=<n> chars=<n> ttft=<x.xx>s total=<y.yy>s`；
+  异常路径打 `LLM call failed: ... err=<类型>: <消息>`；调用方提前 break 不打。
+- `openai.py` 的 `response()` / `response_with_functions()` 改为返回包装后的
+  生成器，原实现移到 `_response_stream()` / `_response_with_functions_stream()`。
+- `connection.py` 在 `chat()` 组好 `messages_for_llm` 之后调 `_note_llm_prefix()`，
+  指纹变化时打 `LLM prefix changed: <old>-><new> (tools <n_old>-><n_new>)`。
+
+**Tests**: `main/xiaozhi-server/test/test_llm_call_telemetry.py`（a–c）。
+
+**Verify after merge**: `grep -n "instrument_stream" core/providers/llm/openai/openai.py` = 3 hits；
+`grep -n "_note_llm_prefix" core/connection.py` = 2 hits。
+
 > **SUPERSEDED — VAD ONNX patch (commit `0ad7cf4a`).** We used to carry a
 > `core/providers/vad/silero_onnx_wrapper.py` shim so Silero VAD ran on
 > onnxruntime instead of torch. Upstream has since rewritten

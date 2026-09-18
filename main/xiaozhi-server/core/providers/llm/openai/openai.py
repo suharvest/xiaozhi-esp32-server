@@ -4,6 +4,7 @@ from openai.types import CompletionUsage
 from config.logger import setup_logging
 from core.utils.util import check_model_key
 from core.providers.llm.base import LLMProviderBase
+from core.providers.llm.telemetry import instrument_stream
 from urllib.parse import urlparse
 
 TAG = __name__
@@ -139,6 +140,12 @@ class LLMProvider(LLMProviderBase):
                 break
 
     def response(self, session_id, dialogue, **kwargs):
+        # 包一层遥测：记录前缀指纹与 TTFT（见 core/providers/llm/telemetry.py）
+        return instrument_stream(
+            self._response_stream(session_id, dialogue, **kwargs), dialogue, None
+        )
+
+    def _response_stream(self, session_id, dialogue, **kwargs):
         dialogue = self._adapt_tool_arguments(self.normalize_dialogue(dialogue))
 
         request_params = {
@@ -185,6 +192,18 @@ class LLMProvider(LLMProviderBase):
             responses.close()
 
     def response_with_functions(self, session_id, dialogue, functions=None, **kwargs):
+        # 包一层遥测：记录前缀指纹与 TTFT（见 core/providers/llm/telemetry.py）
+        return instrument_stream(
+            self._response_with_functions_stream(
+                session_id, dialogue, functions=functions, **kwargs
+            ),
+            dialogue,
+            functions,
+        )
+
+    def _response_with_functions_stream(
+        self, session_id, dialogue, functions=None, **kwargs
+    ):
         dialogue = self._adapt_tool_arguments(self.normalize_dialogue(dialogue))
 
         request_params = {
