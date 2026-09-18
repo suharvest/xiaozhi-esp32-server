@@ -101,6 +101,10 @@ class ConnectionHandler:
         # LLM 前缀缓存遥测：上一次调用的前缀指纹与工具数（见 _note_llm_prefix）
         self._llm_prefix_last_md5 = None
         self._llm_prefix_last_tools = None
+        # LLM 前缀预热（见 _warm_llm_prefix）：去抖任务 + 互斥 + 真实请求计数
+        self._llm_prefix_warmup_task = None
+        self._llm_prefix_warmup_lock = threading.Lock()
+        self._llm_chat_active = 0
 
         self.need_bind = False  # 是否需要绑定设备
         self.bind_completed_event = asyncio.Event()
@@ -658,6 +662,8 @@ class ConnectionHandler:
             self._init_prompt_enhancement()
             """注入工具调用few-shot示例（仅function_call模式）"""
             self._inject_tool_call_fewshot()
+            """连接就绪：预热 EdgeLLM 的前缀 KV 缓存"""
+            self._schedule_llm_prefix_warmup("connection_ready")
 
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"实例化组件失败: {e}")
@@ -1048,6 +1054,16 @@ class ConnectionHandler:
         if query is not None:
             self.logger.bind(tag=TAG).info(f"大模型收到用户消息: {query}")
 
+        # 真实请求在跑时不做前缀预热（真实请求本身就会把前缀捂热）
+        # getattr 兜底：单测会绕过 __init__ 直接构造 ConnectionHandler
+        self._llm_chat_active = getattr(self, "_llm_chat_active", 0) + 1
+        try:
+            return self._chat_inner(query, depth, current_sentence_id)
+        finally:
+            self._llm_chat_active = max(0, getattr(self, "_llm_chat_active", 1) - 1)
+
+    def _chat_inner(self, query, depth=0, current_sentence_id=None):
+
         # 为最顶层时新建会话ID和发送FIRST请求
         if depth == 0:
             current_sentence_id = str(uuid.uuid4().hex)
@@ -1387,6 +1403,123 @@ class ConnectionHandler:
     # ------------------------------------------------------------------
     # A2/A3 LLM 调用与兜底
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # LLM 前缀预热（EdgeLLM KV 前缀缓存）
+    # ------------------------------------------------------------------
+    def _llm_prefix_warmup_enabled(self) -> bool:
+        return bool(self.config.get("llm_prefix_warmup_enabled", True))
+
+    def _llm_prefix_warmup_debounce(self) -> float:
+        try:
+            value = float(self.config.get("llm_prefix_warmup_debounce_sec", 1.5))
+        except (TypeError, ValueError):
+            value = 1.5
+        return value if value >= 0 else 1.5
+
+    def _schedule_llm_prefix_warmup(self, reason: str):
+        """去抖调度一次前缀预热。
+
+        工具列表是分批到达的（设备 MCP 每批一次 refresh_tools、MCP 接入点就绪
+        一次），每批都预热等于每批都重算一遍 prefill。这里只保留最后一次变化后
+        `llm_prefix_warmup_debounce_sec` 秒的那一次。
+        """
+        if not self._llm_prefix_warmup_enabled():
+            return
+        loop = getattr(self, "loop", None)
+        if loop is None:
+            return
+
+        def _arm():
+            try:
+                task = self._llm_prefix_warmup_task
+                if task is not None and not task.done():
+                    task.cancel()
+                self._llm_prefix_warmup_task = loop.create_task(
+                    self._llm_prefix_warmup_later(
+                        self._llm_prefix_warmup_debounce(), reason
+                    )
+                )
+            except Exception as e:
+                self.logger.bind(tag=TAG).debug(f"前缀预热调度失败: {e}")
+
+        try:
+            loop.call_soon_threadsafe(_arm)
+        except Exception as e:
+            self.logger.bind(tag=TAG).debug(f"前缀预热调度失败: {e}")
+
+    async def _llm_prefix_warmup_later(self, delay: float, reason: str):
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        try:
+            await asyncio.to_thread(self._warm_llm_prefix, reason)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger.bind(tag=TAG).warning(f"LLM prefix warmup ({reason}) 失败: {e}")
+
+    def _warm_llm_prefix(self, reason: str):
+        """用与 chat() 相同的前缀发一次 max_tokens=1 的请求，把 KV 前缀捂热。
+
+        不写 dialogue、不进 TTS、不上报；任何异常只打 WARNING。
+        """
+        if not self._llm_prefix_warmup_enabled():
+            return
+        if self.stop_event.is_set() or self.llm is None:
+            return
+        if getattr(self, "_llm_chat_active", 0) > 0:
+            self.logger.bind(tag=TAG).debug(
+                f"LLM prefix warmup ({reason}) 跳过：本轮对话正在进行"
+            )
+            return
+        if not self._llm_prefix_warmup_lock.acquire(blocking=False):
+            self.logger.bind(tag=TAG).debug(
+                f"LLM prefix warmup ({reason}) 跳过：已有预热在跑"
+            )
+            return
+        try:
+            from core.providers.llm.telemetry import compute_prefix_md5
+
+            functions = None
+            if (
+                self.intent_type == "function_call"
+                and getattr(self, "func_handler", None) is not None
+            ):
+                functions = list(self.func_handler.get_functions() or [])
+                functions.append(DIRECT_ANSWER_TOOL)
+
+            # 前缀 = 静态 system + few-shot + 动态 system，不含任何真实对话消息
+            messages = self.dialogue.get_llm_dialogue_with_memory(
+                None,
+                self.config.get("voiceprint", {}),
+                current_speaker=None,
+                max_history_turns=0,
+                include_history=False,
+            )
+            # 末尾补一条极短用户消息：OpenAI 兼容服务端一般不接受以 system 收尾
+            messages = messages + [{"role": "user", "content": "。"}]
+
+            started = time.time()
+            if functions is not None:
+                stream = self.llm.response_with_functions(
+                    self.session_id, messages, functions=functions, max_tokens=1
+                )
+            else:
+                stream = self.llm.response(self.session_id, messages, max_tokens=1)
+            for _ in stream:
+                pass
+            self.logger.bind(tag=TAG).info(
+                f"LLM prefix warmup ({reason}): "
+                f"prefix={compute_prefix_md5(messages, functions)} "
+                f"tools={len(functions or [])} took={time.time() - started:.2f}s"
+            )
+        except Exception as e:
+            self.logger.bind(tag=TAG).warning(f"LLM prefix warmup ({reason}) 失败: {e}")
+        finally:
+            self._llm_prefix_warmup_lock.release()
+
     def _note_llm_prefix(self, messages, functions):
         """比对本次与上次的前缀指纹，变化时打 INFO。
 
@@ -2052,6 +2185,12 @@ class ConnectionHandler:
             # 清理音频缓冲区
             if hasattr(self, "audio_buffer"):
                 self.audio_buffer.clear()
+
+            # 取消待发的前缀预热
+            task = getattr(self, "_llm_prefix_warmup_task", None)
+            if task is not None and not task.done():
+                task.cancel()
+                self._llm_prefix_warmup_task = None
 
             # 取消超时任务
             if self.timeout_task and not self.timeout_task.done():

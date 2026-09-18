@@ -316,6 +316,40 @@ OVS 发一条 TTS 流（抢 5 次会话槽）并把帧塞进播放队列。
 **Verify after merge**: `grep -n "instrument_stream" core/providers/llm/openai/openai.py` = 3 hits；
 `grep -n "_note_llm_prefix" core/connection.py` = 2 hits。
 
+### B1i. 连接就绪与工具变化后预热 EdgeLLM 前缀缓存（2026-09-18）
+
+**What**: `core/connection.py`、`core/utils/dialogue.py`（新参数
+`include_history`）、`core/providers/tools/unified_tool_manager.py`、
+`core/providers/llm/base.py`（`response_with_functions` 加 `**kwargs`）+
+`config.yaml`（新键 `llm_prefix_warmup_enabled` / `llm_prefix_warmup_debounce_sec`）。
+
+**Why**: 接 B1h。冷前缀一次 prefill 9~13s，设备约 10s 收不到音频就断线；工具列表
+是分批到达的（设备 MCP 每批一次、MCP 接入点就绪一次），前缀在连接建立后的头几秒
+里会变好几次，第一句真实提问十有八九撞上冷前缀。
+
+**How**:
+- `ConnectionHandler._warm_llm_prefix(reason)`：走与 `chat()` 相同的组装路径拿
+  `functions`（含 `DIRECT_ANSWER_TOOL`）与 messages（静态 system + few-shot +
+  动态 system，`include_history=False`，末尾补一条 `"。"` 让请求不以 system 收尾），
+  以 `max_tokens=1` 发一次流并丢弃输出。不写 dialogue、不进 TTS、不上报；
+  非阻塞锁保证同一连接同时只有一次预热；`_llm_chat_active > 0`（真实对话进行中）
+  直接跳过；任何异常只打 WARNING。日志
+  `LLM prefix warmup (<reason>): prefix=<md5> tools=<n> took=<x.xx>s`。
+- 触发：`_initialize_components()` 注入 few-shot 之后一次（`connection_ready`）；
+  `ToolManager.refresh_tools()` 一次（`tools_changed`）——所有工具来源都从这个方法过。
+  两者都走 `_schedule_llm_prefix_warmup()`，用可取消的 asyncio 任务做去抖，
+  最后一次变化后 `llm_prefix_warmup_debounce_sec`（默认 1.5）秒才真正发出；
+  实际请求在 `asyncio.to_thread` 里跑，不占事件循环。`close()` 取消待发任务。
+- `Dialogue.get_llm_dialogue_with_memory(..., include_history=False)` 只产出前缀
+  三段，不带任何真实用户/助手消息（默认 True，既有调用不变）。
+
+**Config**: `llm_prefix_warmup_enabled: true`、`llm_prefix_warmup_debounce_sec: 1.5`。
+
+**Tests**: `main/xiaozhi-server/test/test_llm_prefix_warmup.py`（a–d）。
+
+**Verify after merge**: `grep -n "_schedule_llm_prefix_warmup" core/connection.py core/providers/tools/unified_tool_manager.py` ≥ 4 hits；
+`grep -n "include_history" core/utils/dialogue.py` = 3 hits。
+
 > **SUPERSEDED — VAD ONNX patch (commit `0ad7cf4a`).** We used to carry a
 > `core/providers/vad/silero_onnx_wrapper.py` shim so Silero VAD ran on
 > onnxruntime instead of torch. Upstream has since rewritten

@@ -87,6 +87,16 @@ tool_result_candidate_limit: 5
 # 显式空字符串 = 不播
 llm_context_overflow_reply: "信息太多，我先清一下，请再说一遍"
 
+# LLM 前缀缓存预热（治 EdgeLLM 冷前缀）。现场 EdgeLLM 只为「开头 system 块
+# （静态 system prompt + tools）」保留 KV 检查点：前缀热时 TTFT 1.3~2.3s，
+# 前缀冷时要整段重新 prefill，实测 9~13s，而设备约 10s 收不到音频就断线。
+# 开启后，连接就绪与工具列表变化（设备 MCP 分批到达、MCP 接入点就绪、
+# refresh_tools）之后各发一次 max_tokens=1 的空请求把前缀捂热；
+# 预热不写对话历史、不进 TTS、不上报，真实对话进行中自动跳过。
+llm_prefix_warmup_enabled: true
+# 去抖秒数：最后一次工具变化之后等这么久才真正发预热请求
+llm_prefix_warmup_debounce_sec: 1.5
+
 # ASR 无结果时的兑底播报。ASR 后端不可达/异常/超时/识别为空时，服务端补播
 # 一句话让设备播完回到「待命」，而不是卡在「聆听中」只能断电。
 # 设为 false 关闭兑底播报；话术显式设为空字符串则对应分支不播。
