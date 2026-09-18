@@ -63,6 +63,9 @@ class ASRProviderBase(ABC):
 
     # 接收音频
     async def receive_audio(self, conn: "ConnectionHandler", pcm_frame, audio_have_voice):
+        # 记录最后一帧音频到达时刻（monotonic），listen 超时兜底靠它判断
+        # 「用户还在说」还是「音频真的断了」。所有流式 ASR 子类都会 super() 到这里。
+        conn._last_audio_frame_ts = time.monotonic()
         if conn.client_listen_mode == "manual":
             # 手动模式：缓存音频用于ASR识别
             conn.asr_audio.append(pcm_frame)
@@ -302,24 +305,62 @@ class ASRProviderBase(ABC):
             task.cancel()
         conn._listen_timeout_task = None
 
+    @staticmethod
+    def _listen_timeout_float(conn: "ConnectionHandler", key: str, default: float) -> float:
+        try:
+            return float(conn.config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
     def _start_listen_timeout(self, conn: "ConnectionHandler"):
         """收到 listen start 后起表；功能关闭时行为与原来完全一致。"""
         self._cancel_listen_timeout(conn)
         if not conn.config.get("asr_listen_timeout_enabled", True):
             return
-        try:
-            sec = float(conn.config.get("asr_listen_timeout_sec", 15))
-        except (TypeError, ValueError):
-            sec = 15.0
+        sec = self._listen_timeout_float(conn, "asr_listen_timeout_sec", 15.0)
         if sec <= 0:
             return
+        # 新一轮聆听开始，上一轮的音频帧时刻不算数
+        conn._last_audio_frame_ts = None
         conn._listen_timeout_task = asyncio.create_task(
             self._listen_timeout_waiter(conn, sec)
         )
 
     async def _listen_timeout_waiter(self, conn: "ConnectionHandler", sec: float):
+        # 硬计时到点就播「没听清」踩过一次：现场用户连续说了 12.7s，VAD 没判停，
+        # 15s 到点插播兜底，5s 后 ASR 才把长句吐出来（日志：已等待=15s,
+        # 收到音频帧数=212）。所以到点只是「开始怀疑」，真正触发要求
+        # 「连续 quiet 秒没有新音频帧」，总时长上限 asr_listen_timeout_max_sec。
+        quiet = self._listen_timeout_float(conn, "asr_listen_timeout_quiet_sec", 3.0)
+        max_sec = self._listen_timeout_float(conn, "asr_listen_timeout_max_sec", 60.0)
+        waited = sec
+        since_last = None
         try:
             await asyncio.sleep(sec)
+            while quiet > 0:
+                last_ts = getattr(conn, "_last_audio_frame_ts", None)
+                if last_ts is None:
+                    # 一帧都没收到过：没什么可等的，直接兜底
+                    break
+                since_last = time.monotonic() - last_ts
+                if since_last >= quiet:
+                    break
+                if max_sec > 0 and waited >= max_sec:
+                    logger.bind(tag=TAG).warning(
+                        f"listen 超时顺延已达上限 {max_sec:.0f}s，仍在收音频，强制兜底"
+                    )
+                    break
+                extra = quiet - since_last
+                if max_sec > 0:
+                    extra = min(extra, max_sec - waited)
+                if extra <= 0:
+                    break
+                logger.bind(tag=TAG).info(
+                    f"listen 超时顺延: 已等待={waited:.0f}s, "
+                    f"最后一帧距今={since_last:.1f}s(<{quiet:.1f}s), 再等 {extra:.1f}s"
+                )
+                await asyncio.sleep(extra)
+                waited += extra
         except asyncio.CancelledError:
             # 正常取消（ASR出文本/voice_stop/client_abort/新一轮listen/连接关闭）
             return
@@ -331,9 +372,13 @@ class ASRProviderBase(ABC):
                 return
             if conn.stop_event.is_set():
                 return
+            last_ts = getattr(conn, "_last_audio_frame_ts", None)
+            since_last = None if last_ts is None else time.monotonic() - last_ts
             logger.bind(tag=TAG).warning(
                 f"listen 超时兜底: session_id={conn.session_id}, "
-                f"已等待={sec:.0f}s, 收到音频帧数={audio_frames}, 补播兜底话术"
+                f"已等待={waited:.0f}s, 收到音频帧数={audio_frames}, "
+                f"最后一帧距今={'n/a' if since_last is None else format(since_last, '.1f') + 's'}, "
+                f"补播兜底话术"
             )
             # 话术：默认沿用 asr_empty_reply；显式空字符串 = 不播
             reply = conn.config.get("asr_listen_timeout_reply")

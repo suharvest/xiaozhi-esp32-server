@@ -385,6 +385,27 @@ depth>0 注入不会循环：`direct_answer` 的处理是「流式播报 + 写�
 
 **Tests**: `test/test_llm_prefix_warmup.py` (f)。
 
+### B1l. listen 超时在音频仍在到达时顺延（2026-09-18）
+
+**What**: `core/providers/asr/base.py`（`receive_audio()` 记 `conn._last_audio_frame_ts`；
+`_listen_timeout_waiter()` 改为 quiet 窗口轮询）+ `config.yaml`（新键
+`asr_listen_timeout_quiet_sec` 默认 3.0、`asr_listen_timeout_max_sec` 默认 60）。
+
+**Why**: 接 B1c。原实现是硬计时：`asr_listen_timeout_sec` 到点就播兜底。现场日志
+`listen 超时兜底: 已等待=15s, 收到音频帧数=212, 补播兜底话术` —— 用户连续说了
+12.7s，VAD 没判停，服务端插播「没听清」，5s 后 ASR 才把长句吐出来。
+
+**How**: 到点只是「开始怀疑」。若最后一帧距今 < `asr_listen_timeout_quiet_sec`
+就再等一个 quiet 窗口后复查（循环），只有「连续 quiet 秒无音频帧」且仍无 ASR 文本
+/ voice_stop 才真正兜底；总时长上限 `asr_listen_timeout_max_sec`（从 listen start
+起算），到顶仍在收音频也强制兜底并打 WARNING。兜底日志加上帧数与最后一帧距今秒数。
+`quiet <= 0` 退回原来的硬计时行为。所有流式 ASR 子类的 `receive_audio()` 都
+`super()` 到基类，时间戳一处记录即可。
+
+**Tests**: `test/test_listen_timeout.py` (d)(e)。
+
+**Verify after merge**: `grep -n "_last_audio_frame_ts" core/providers/asr/base.py` = 4 hits。
+
 > **SUPERSEDED — VAD ONNX patch (commit `0ad7cf4a`).** We used to carry a
 > `core/providers/vad/silero_onnx_wrapper.py` shim so Silero VAD ran on
 > onnxruntime instead of torch. Upstream has since rewritten

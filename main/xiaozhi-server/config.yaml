@@ -118,6 +118,12 @@ asr_listen_timeout_enabled: true
 asr_listen_timeout_sec: 15
 # 超时话术；不配置则默认沿用 asr_empty_reply；显式空字符串 = 超时不播报
 # asr_listen_timeout_reply: "没听清，请再说一遍"
+# 到点时若音频仍在到达则顺延：要求"连续 N 秒没有新音频帧"才真正兜底。
+# 现场用户连续说了 12.7s、VAD 未判停，15s 硬计时插播「没听清」，5s 后 ASR 才出长句。
+# 设为 0 或负数 = 关闭顺延，退回硬计时。
+asr_listen_timeout_quiet_sec: 3.0
+# 顺延总时长上限（从 listen start 起算），到顶仍在收音频也强制兜底；0 或负数 = 不限
+asr_listen_timeout_max_sec: 60
 # 开启唤醒词加速
 enable_wakeup_words_response_cache: true
 # 开场是否回复唤醒词
