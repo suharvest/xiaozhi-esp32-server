@@ -10,6 +10,7 @@ from config.manage_api_client import (
     DeviceNotFoundException,
     DeviceBindException,
 )
+from config.local_overrides import apply_local_overrides
 
 
 def get_project_dir():
@@ -81,6 +82,8 @@ async def get_config_from_api_async(config):
     # 如果服务器没有prompt_template，则从本地配置读取
     if not config_data.get("prompt_template"):
         config_data["prompt_template"] = config.get("prompt_template")
+    # manager 不认识的本地权威键（白名单）从 data/.config.yaml 合并回来
+    apply_local_overrides(config_data, config)
     return config_data
 
 

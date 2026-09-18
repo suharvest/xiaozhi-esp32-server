@@ -189,6 +189,15 @@ context_providers:
     headers:
       Authorization: ""
 
+# 从服务端必载/配置的插件列表里排除指定插件（按函数名）。
+# 上游把 get_lunar 写死在 necessary_functions 里，智控台上关不掉；工具列表每多一个
+# 条目就多一段前缀，EdgeLLM 只缓存 system+tools 这段 KV。
+# handle_exit_intent 是退出意图的唯一入口，写在这里会被忽略并打 WARNING。
+# console（manager-api）模式下这个键要写在 data/.config.yaml，由 config/local_overrides.py
+# 的白名单合并回来。
+server_plugins_exclude: []
+#  - get_lunar
+
 # 插件的基础配置
 plugins:
   # 获取天气插件的配置，这里填写你的api_key
