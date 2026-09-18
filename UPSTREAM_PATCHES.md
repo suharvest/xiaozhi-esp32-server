@@ -350,6 +350,28 @@ OVS 发一条 TTS 流（抢 5 次会话槽）并把帧塞进播放队列。
 **Verify after merge**: `grep -n "_schedule_llm_prefix_warmup" core/connection.py core/providers/tools/unified_tool_manager.py` ≥ 4 hits；
 `grep -n "include_history" core/utils/dialogue.py` = 3 hits。
 
+### B1j. `direct_answer` 在所有深度注入，工具列表跨轮稳定（2026-09-18）
+
+**What**: `core/connection.py`（新增 `_build_llm_functions()`，`chat()` 与
+`_warm_llm_prefix()` 共用）。
+
+**Why**: 接 B1h/B1i。原来只在 `depth == 0` 追加 `DIRECT_ANSWER_TOOL`，工具结果那
+一轮少一个工具，EdgeLLM 的「静态 system + tools」前缀立刻失配。现场日志
+（2026-09-18 11:10）：`tools=29 ttft=0.55s` → `prefix changed (tools 29->28)` →
+`tools=28 ttft=2.37s` → 下一轮又变回 29，每轮都在整段重算 prefill。
+
+**How**: `_build_llm_functions(force_final_answer=False)` 返回
+`func_handler.get_functions() + [DIRECT_ANSWER_TOOL]`（追加在末尾，顺序不变），
+所有深度一致；`force_final_answer`（撞 `MAX_DEPTH`）仍返回 `None` 禁用工具。
+depth>0 注入不会循环：`direct_answer` 的处理是「流式播报 + 写对话历史 + return」，
+不递归回 `chat()`；该分支补上 `_pending_tool_answer = False`，答案短于流式安全
+缓冲区时也不会在 `depth == 0` 收尾被重复补一句兜底。
+
+**Tests**: `test/test_llm_prefix_warmup.py` (e)。
+
+**Verify after merge**: `grep -n "DIRECT_ANSWER_TOOL" core/connection.py` = 2 hits
+（定义 + `_build_llm_functions`）。
+
 > **SUPERSEDED — VAD ONNX patch (commit `0ad7cf4a`).** We used to carry a
 > `core/providers/vad/silero_onnx_wrapper.py` shim so Silero VAD ran on
 > onnxruntime instead of torch. Upstream has since rewritten

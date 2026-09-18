@@ -1105,18 +1105,9 @@ class ConnectionHandler:
             )
 
         # Define intent functions
-        functions = None
-        # 达到最大深度时，禁用工具调用，强制 LLM 直接回答
-        if (
-                self.intent_type == "function_call"
-                and hasattr(self, "func_handler")
-                and not force_final_answer
-        ):
-            functions = list(self.func_handler.get_functions())
-            # 仅在第一层调用时注入 direct_answer 虚拟工具
-            # 递归调用（depth>0）不注入，避免模型在生成文本回复时再次调 direct_answer 导致循环
-            if functions is not None and depth == 0:
-                functions.append(DIRECT_ANSWER_TOOL)
+        # 达到最大深度时（force_final_answer）禁用工具调用，强制 LLM 直接回答；
+        # 其余深度一律用同一份工具列表，见 _build_llm_functions() 的说明。
+        functions = self._build_llm_functions(force_final_answer=force_final_answer)
 
         response_message = []
 
@@ -1238,6 +1229,9 @@ class ConnectionHandler:
                             da_response = self._clean_response_garbage(da_response)
                             self.tts.store_tts_text(current_sentence_id, da_response)
                             self.dialogue.put(Message(role="assistant", content=da_response))
+                            # 结论已给出：清掉工具兜底欠账，避免 depth==0 收尾再补一句
+                            # （答案短于流式安全缓冲区时，流式那段来不及清）
+                            self._pending_tool_answer = False
 
                     if not real_tool_calls:
                         if depth == 0:
@@ -1482,13 +1476,8 @@ class ConnectionHandler:
         try:
             from core.providers.llm.telemetry import compute_prefix_md5
 
-            functions = None
-            if (
-                self.intent_type == "function_call"
-                and getattr(self, "func_handler", None) is not None
-            ):
-                functions = list(self.func_handler.get_functions() or [])
-                functions.append(DIRECT_ANSWER_TOOL)
+            # 必须与 chat() 用同一份构造，否则预热出来的前缀对不上真实请求
+            functions = self._build_llm_functions()
 
             # 前缀 = 静态 system + few-shot + 动态 system，不含任何真实对话消息
             messages = self.dialogue.get_llm_dialogue_with_memory(
@@ -1541,6 +1530,30 @@ class ConnectionHandler:
             self._llm_prefix_last_tools = n_tools
         except Exception as e:
             self.logger.bind(tag=TAG).debug(f"前缀指纹记录失败: {e}")
+
+    def _build_llm_functions(self, force_final_answer: bool = False):
+        """构造送给 LLM 的 functions 列表；chat() 与前缀预热共用同一份构造。
+
+        DIRECT_ANSWER_TOOL 在**所有深度**都追加在末尾，保证同一连接内 functions
+        逐字一致。EdgeLLM 只缓存「静态 system + tools」这段前缀，工具 JSON 少一个
+        条目就整段重算 prefill —— 现场日志里 depth==0 那轮 ttft=0.55s（29 个工具、
+        前缀命中），工具结果那轮少了 direct_answer（28 个工具）前缀立刻失配，
+        ttft 涨到 2.37s，下一轮又变回 29 个，来回把缓存打翻。
+
+        depth>0 也注入不会导致循环：direct_answer 的处理是「流式播报 + 写对话历史
+        + return」（见 chat() 的 direct_answer_calls 分支），不会递归回 chat()。
+
+        force_final_answer（撞到 MAX_DEPTH）时返回 None，行为与原来一致。
+        """
+        if force_final_answer:
+            return None
+        if self.intent_type != "function_call":
+            return None
+        if getattr(self, "func_handler", None) is None:
+            return None
+        functions = list(self.func_handler.get_functions() or [])
+        functions.append(DIRECT_ANSWER_TOOL)
+        return functions
 
     def _invoke_llm(self, messages, functions):
         """按意图类型调用 LLM（流式）。错误可能在调用时或首次迭代时抛出。"""
