@@ -18,7 +18,9 @@
       TTS 队列为空；请求带 max_tokens=1；
   (b) 1.5s 去抖窗口内连续 3 次工具变化只真正预热 1 次；
   (c) llm_prefix_warmup_enabled=false 时既不调度也不发请求；
-  (d) 真实对话进行中（_llm_chat_active>0）跳过预热。
+  (d) 真实对话进行中（_llm_chat_active>0）跳过预热；
+  (e) depth 0 与 depth>0 的 functions 前缀指纹相同，且与预热用的相同
+      （direct_answer 所有深度都注入，工具列表跨轮逐字稳定）。
 """
 import asyncio
 import os
@@ -55,6 +57,7 @@ _bootstrap()
 from core import connection as conn_mod  # noqa: E402
 from core.connection import ConnectionHandler  # noqa: E402
 from core.utils.dialogue import Dialogue, Message  # noqa: E402
+from core.providers.llm.telemetry import compute_prefix_md5  # noqa: E402
 from config.logger import setup_logging  # noqa: E402
 
 REAL_USER_TEXT = "10-8四通还有多少"
@@ -201,9 +204,39 @@ def test_d_skip_while_chat_active():
     print("(d) 真实对话进行中跳过预热  ✓")
 
 
+def test_e_functions_identical_across_depths():
+    """工具列表跨深度逐字一致 —— EdgeLLM 前缀缓存的命中条件。
+
+    现场日志（2026-09-18 11:10）：depth 0 tools=29 ttft=0.55s，工具结果那轮
+    tools=28 ttft=2.37s，下一轮又变回 29 —— direct_answer 只在 depth==0 注入，
+    每一轮都把前缀打翻。
+    """
+    conn = make_conn()
+    f0 = conn._build_llm_functions(force_final_answer=False)
+    f1 = conn._build_llm_functions(force_final_answer=False)  # depth>0 同一构造
+    assert f0 == f1, (f0, f1)
+    names = [f["function"]["name"] for f in f0]
+    assert names == ["query_stock", "direct_answer"], names
+
+    messages = [{"role": "system", "content": "你是小智。"}]
+    md5_0 = compute_prefix_md5(messages, f0)
+    md5_1 = compute_prefix_md5(messages, f1)
+    assert md5_0 == md5_1, (md5_0, md5_1)
+
+    # 预热走的是同一个 _build_llm_functions，指纹必须对得上
+    conn._warm_llm_prefix("connection_ready")
+    warm_functions = conn.llm.calls[-1]["functions"]
+    assert compute_prefix_md5(messages, warm_functions) == md5_0
+
+    # 撞到 MAX_DEPTH 时禁用工具，行为与原来一致
+    assert conn._build_llm_functions(force_final_answer=True) is None
+    print("(e) depth 0/1 与预热的 functions 指纹一致  ✓")
+
+
 if __name__ == "__main__":
     test_a_warmup_messages_exclude_real_history()
     test_b_debounce_collapses_three_changes()
     test_c_disabled_does_nothing()
     test_d_skip_while_chat_active()
+    test_e_functions_identical_across_depths()
     print("\n全部通过 ✓")
