@@ -10,9 +10,20 @@
 把 ASR/TTS/LLM 之类 manager 已经在管的段落放进来会让网页上的改动失效。
 """
 
-# 白名单：只列 manager 不认识、必须由本地文件说了算的顶层键
+# 白名单：只列 manager 不认识、必须由本地文件说了算的顶层键。
+# 仍然不含 ASR/TTS/LLM/selected_module —— 那几段由 manager 管着，放进来会让
+# 网页上的改动失效。
 LOCAL_AUTHORITATIVE_KEYS = (
     "server_plugins_exclude",
+    # 工具调用
+    "mcp_tool_call_timeout_sec",
+    # ASR 监听窗口与空音频判定
+    "asr_listen_timeout_quiet_sec",
+    "asr_listen_timeout_max_sec",
+    "asr_empty_min_frames",
+    # LLM 前缀预热
+    "llm_prefix_warmup_enabled",
+    "llm_prefix_warmup_debounce_sec",
 )
 
 

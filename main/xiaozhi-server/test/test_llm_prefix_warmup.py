@@ -21,7 +21,9 @@
   (d) 真实对话进行中（_llm_chat_active>0）跳过预热；
   (e) depth 0 与 depth>0 的 functions 前缀指纹相同，且与预热用的相同
       （direct_answer 所有深度都注入，工具列表跨轮逐字稳定）；
-  (f) 前缀变化日志带 added=/removed= 工具名差集。
+  (f) 前缀变化日志带 added=/removed= 工具名差集；
+  (g) 锁忙而跳过的那次会被补一次（pending → 再调度一次）；
+  (h) stop_event 已置位时直接返回，不发请求。
 """
 import asyncio
 import os
@@ -128,6 +130,7 @@ def make_conn(config=None, llm=None):
     conn.loop = None
     conn._llm_prefix_warmup_task = None
     conn._llm_prefix_warmup_lock = threading.Lock()
+    conn._llm_prefix_warmup_pending = False
     conn._llm_chat_active = 0
     conn._llm_prefix_last_md5 = None
     conn._llm_prefix_last_tools = None
@@ -266,6 +269,49 @@ def test_f_prefix_change_logs_tool_name_diff():
     print("(f) 前缀变化日志带工具名 diff  ✓")
 
 
+
+def test_g_skipped_warmup_is_retried():
+    """锁忙时跳过的那次带着新工具列表，必须在当前这次跑完后补上。"""
+    conn = make_conn()
+    scheduled = []
+    conn._schedule_llm_prefix_warmup = lambda reason: scheduled.append(reason)
+
+    # 另一个线程占着锁 → 这次被跳过，只留标记
+    conn._llm_prefix_warmup_lock.acquire()
+    try:
+        conn._warm_llm_prefix("tools_changed")
+        assert conn.llm.calls == [], conn.llm.calls
+        assert conn._llm_prefix_warmup_pending is True
+        assert scheduled == [], scheduled
+    finally:
+        conn._llm_prefix_warmup_lock.release()
+
+    # 锁空了：这次真正跑，跑完把挂起的那次补回去
+    conn._warm_llm_prefix("connection_ready")
+    assert len(conn.llm.calls) == 1, conn.llm.calls
+    assert scheduled == ["pending"], scheduled
+    assert conn._llm_prefix_warmup_pending is False
+    assert not conn._llm_prefix_warmup_lock.locked(), "锁没放回去"
+
+    # 连接已关闭时不再补
+    conn._llm_prefix_warmup_pending = True
+    conn.stop_event.set()
+    scheduled.clear()
+    conn._warm_llm_prefix("connection_ready")
+    assert scheduled == [], scheduled
+    print("(g) 锁忙跳过的预热在当前这次结束后补一次  ✓")
+
+
+def test_h_stop_event_short_circuits():
+    conn = make_conn()
+    conn.stop_event.set()
+    conn._warm_llm_prefix("connection_ready")
+    assert conn.llm.calls == [], conn.llm.calls
+    assert conn._llm_prefix_warmup_pending is False
+    assert not conn._llm_prefix_warmup_lock.locked()
+    print("(h) stop_event 已置位 → 预热直接返回  ✓")
+
+
 if __name__ == "__main__":
     test_a_warmup_messages_exclude_real_history()
     test_b_debounce_collapses_three_changes()
@@ -273,4 +319,6 @@ if __name__ == "__main__":
     test_d_skip_while_chat_active()
     test_e_functions_identical_across_depths()
     test_f_prefix_change_logs_tool_name_diff()
+    test_g_skipped_warmup_is_retried()
+    test_h_stop_event_short_circuits()
     print("\n全部通过 ✓")
