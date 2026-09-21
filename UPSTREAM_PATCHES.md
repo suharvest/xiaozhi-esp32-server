@@ -433,6 +433,40 @@ depth>0 注入不会循环：`direct_answer` 的处理是「流式播报 + 写�
 
 **Verify after merge**: `grep -n "apply_local_overrides" config/config_loader.py` = 2 hits。
 
+### B1n. MCP 工具调用超时可配（默认 8s）并返回可播报结果（2026-09-21）
+
+**What**: `core/providers/tools/mcp_endpoint/mcp_endpoint_handler.py`、
+`core/providers/tools/mcp_endpoint/mcp_endpoint_executor.py`、
+`core/connection.py`（`工具调用超时或异常` 分支前加一个 `CancelledError` 分支）
++ `config.yaml`（新键 `mcp_tool_call_timeout_sec`，默认 8）。
+
+**Why**: 上游 `call_mcp_endpoint_tool()` 的超时写死 30s，而设备端约 10s
+收不到音频就主动断线。后端慢或不可达时，工具这一轮要等 30s，设备早断了；
+断开又会 cancel 掉这些 future，`core/connection.py` 把 `CancelledError`
+记成 ERROR，而它的 `str(e)` 恒为空 —— 现场一天 16 条错误信息为空的 ERROR
+就是这么来的，真正的工具失败反而被淹没。
+
+**How**:
+1. `DEFAULT_MCP_TOOL_CALL_TIMEOUT = 8` 作为函数签名默认值，执行器从
+   `conn.config["mcp_tool_call_timeout_sec"]` 取值传入。
+2. 超时不再 `raise TimeoutError`，改为返回
+   `{"ok": false, "executed": false, "say": "查询超时，请稍后再试",
+   "say_kind": "tell", "error": "tool_timeout"}` 的 JSON 字符串 —— 与备品 WMS
+   Provider 的返回体同构，LLM 按提示词第 9 条照搬 `say` 播报；同时打一条带
+   工具名与秒数的 WARNING。
+3. `core/connection.py` 的 `CancelledError`（设备断开）降为 INFO，
+   回给用户的兜底话术与上报行为不变。
+
+**Config**: `mcp_tool_call_timeout_sec: 8`。console（manager-api）模式下这个键
+读的是 `conn.config`，与 `tool_call_timeout`（上层 future 的总超时，仍是 30）
+是两个值：前者管单个 MCP 工具往返，后者管一轮里所有工具加起来。
+
+**Tests**: `main/xiaozhi-server/test/test_mcp_tool_timeout.py`（a/b/b2/b3/c/c2）。
+
+**Verify after merge**: `grep -n "DEFAULT_MCP_TOOL_CALL_TIMEOUT"
+core/providers/tools/mcp_endpoint/*.py` = 4 hits；
+`grep -n "CancelledError" core/connection.py` 命中工具调用那一处。
+
 > **SUPERSEDED — VAD ONNX patch (commit `0ad7cf4a`).** We used to carry a
 > `core/providers/vad/silero_onnx_wrapper.py` shim so Silero VAD ran on
 > onnxruntime instead of torch. Upstream has since rewritten
