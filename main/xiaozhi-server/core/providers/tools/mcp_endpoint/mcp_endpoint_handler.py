@@ -10,6 +10,20 @@ from .mcp_endpoint_client import MCPEndpointClient
 TAG = __name__
 logger = setup_logging()
 
+# 单个 MCP 工具调用的默认超时（秒）。设备端约 10s 收不到音频就主动断线，
+# 所以工具这一轮必须在 10s 内出结果；留 2s 给 LLM 二次组织话术 + TTS 首包。
+# 可用配置键 mcp_tool_call_timeout_sec 覆盖。
+DEFAULT_MCP_TOOL_CALL_TIMEOUT = 8
+# 超时时回给 LLM 的结构化结果，字段与备品 WMS Provider 的返回体一致，
+# 让 LLM 按提示词第 9 条直接照搬 say 播报，而不是把空异常吞成"网络问题"。
+MCP_TOOL_TIMEOUT_RESULT = {
+    "ok": False,
+    "executed": False,
+    "say": "查询超时，请稍后再试",
+    "say_kind": "tell",
+    "error": "tool_timeout",
+}
+
 
 async def connect_mcp_endpoint(mcp_endpoint_url: str, conn=None) -> MCPEndpointClient:
     """连接到MCP接入点"""
@@ -284,10 +298,17 @@ async def send_mcp_endpoint_tools_list_continue(
 
 
 async def call_mcp_endpoint_tool(
-    mcp_client: MCPEndpointClient, tool_name: str, args: str = "{}", timeout: int = 30
+    mcp_client: MCPEndpointClient,
+    tool_name: str,
+    args: str = "{}",
+    timeout: int = DEFAULT_MCP_TOOL_CALL_TIMEOUT,
 ):
     """
     调用指定的MCP接入点工具，并等待响应
+
+    超时不再抛 TimeoutError（上层只会把它记成一条错误信息为空的 ERROR，
+    再回一句"网络遇到点问题"），而是返回结构化的工具结果字符串，让 LLM
+    照搬其中的 say 播报。
     """
     if not await mcp_client.is_ready():
         raise RuntimeError("MCP接入点客户端尚未准备就绪")
@@ -386,7 +407,10 @@ async def call_mcp_endpoint_tool(
         return str(raw_result)
     except asyncio.TimeoutError:
         await mcp_client.cleanup_call_result(tool_call_id)
-        raise TimeoutError("工具调用请求超时")
+        logger.bind(tag=TAG).warning(
+            f"MCP接入点工具调用 {actual_name} 超时（{timeout}秒），返回可播报的超时结果"
+        )
+        return json.dumps(MCP_TOOL_TIMEOUT_RESULT, ensure_ascii=False)
     except Exception as e:
         await mcp_client.cleanup_call_result(tool_call_id)
         raise e

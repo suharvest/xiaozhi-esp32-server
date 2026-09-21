@@ -1329,6 +1329,17 @@ class ConnectionHandler:
                         # 使用公共方法上报工具调用结果
                         enqueue_tool_report(self, tool_call_data['name'], tool_input, str(result.result) if result.result else None, report_tool_call=False)
 
+                    except asyncio.CancelledError:
+                        # 设备断开会取消这些 future，错误信息恒为空。记 ERROR 只会
+                        # 在日志里堆出一批没有内容的报错，掩盖真正的工具失败。
+                        self.logger.bind(tag=TAG).info(
+                            f"工具调用被取消（设备断开）: {tool_call_data['name']}"
+                        )
+                        tool_results.append((
+                            ActionResponse(action=Action.ERROR, result="哎呀，网络遇到点问题，请稍后再试下！"),
+                            tool_call_data
+                        ))
+                        enqueue_tool_report(self, tool_call_data['name'], tool_input, "cancelled", report_tool_call=False)
                     except Exception as e:
                         self.logger.bind(tag=TAG).error(
                             f"工具调用超时或异常: {tool_call_data['name']}, 错误: {e}"

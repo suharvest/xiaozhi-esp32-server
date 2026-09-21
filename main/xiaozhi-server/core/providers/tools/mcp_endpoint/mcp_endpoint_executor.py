@@ -3,7 +3,10 @@
 from typing import Dict, Any
 from ..base import ToolType, ToolDefinition, ToolExecutor
 from plugins_func.register import Action, ActionResponse
-from .mcp_endpoint_handler import call_mcp_endpoint_tool
+from .mcp_endpoint_handler import (
+    DEFAULT_MCP_TOOL_CALL_TIMEOUT,
+    call_mcp_endpoint_tool,
+)
 
 
 class MCPEndpointExecutor(ToolExecutor):
@@ -35,8 +38,13 @@ class MCPEndpointExecutor(ToolExecutor):
             args_str = json.dumps(arguments) if arguments else "{}"
 
             # 调用MCP接入点工具
+            timeout = int(
+                (getattr(conn, "config", None) or {}).get(
+                    "mcp_tool_call_timeout_sec", DEFAULT_MCP_TOOL_CALL_TIMEOUT
+                )
+            )
             result = await call_mcp_endpoint_tool(
-                conn.mcp_endpoint_client, tool_name, args_str
+                conn.mcp_endpoint_client, tool_name, args_str, timeout
             )
 
             resultJson = None
