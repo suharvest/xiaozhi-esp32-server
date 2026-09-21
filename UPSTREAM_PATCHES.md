@@ -422,14 +422,19 @@ depth>0 注入不会循环：`direct_answer` 的处理是「流式播报 + 写�
 
 **注意（与本文件 §C 的出入）**：§C 描述的 `config/local_overrides.py` 与
 `get_config_from_api_async()` 里的 hook 在本分支里**并不存在**（现场容器里也没有），
-本节一并补上。白名单目前只有 `server_plugins_exclude` —— 故意不含
-`ASR`/`TTS`/`LLM`/`selected_module`：那几段现在由 manager 管着，放进白名单会让
-网页上的改动失效。
+本节一并补上。白名单故意不含 `ASR`/`TTS`/`LLM`/`selected_module`：那几段现在由
+manager 管着，放进白名单会让网页上的改动失效。
+
+**白名单内容（2026-09-21 更新）**：除 `server_plugins_exclude` 外，本分支后续
+新增的可调键也必须在里面，否则 console 模式下写在 `data/.config.yaml` 里不生效——
+- `mcp_tool_call_timeout_sec`（B1n）
+- `asr_listen_timeout_quiet_sec` / `asr_listen_timeout_max_sec` / `asr_empty_min_frames`
+- `llm_prefix_warmup_enabled` / `llm_prefix_warmup_debounce_sec`
 
 **Config**: `server_plugins_exclude: []`。console（manager-api）模式下这个键要写在
 `data/.config.yaml`，由 `apply_local_overrides()` 合并回 manager 拉来的配置。
 
-**Tests**: `main/xiaozhi-server/test/test_server_plugins_exclude.py`（a–c）。
+**Tests**: `main/xiaozhi-server/test/test_server_plugins_exclude.py`（a–c；d 覆盖白名单合并）。
 
 **Verify after merge**: `grep -n "apply_local_overrides" config/config_loader.py` = 2 hits。
 

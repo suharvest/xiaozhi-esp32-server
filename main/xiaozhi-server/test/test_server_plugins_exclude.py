@@ -15,7 +15,9 @@
 覆盖三例：
   (a) exclude=[get_lunar] → 工具列表不含 get_lunar，仍含 handle_exit_intent；
   (b) exclude 含 handle_exit_intent → 被忽略（仍在列表里）并打 WARNING；
-  (c) 不配置该键 → 行为与原来一致（get_lunar 仍在）。
+  (c) 不配置该键 → 行为与原来一致（get_lunar 仍在）；
+  (d) console（manager-api）配置 + 本地 .config.yaml 含本地权威键 →
+      合并后这些键对运行期可见，且 manager 管的 ASR/TTS/LLM 段不被本地覆盖。
 """
 import os
 import sys
@@ -50,6 +52,10 @@ from core.providers.tools.server_plugins.plugin_executor import (  # noqa: E402
     ServerPluginExecutor,
 )
 from plugins_func.register import all_function_registry  # noqa: E402
+from config.local_overrides import (  # noqa: E402
+    LOCAL_AUTHORITATIVE_KEYS,
+    apply_local_overrides,
+)
 
 auto_import_modules("plugins_func.functions")  # 注册所有服务端插件
 from loguru import logger as loguru_logger  # noqa: E402
@@ -96,8 +102,46 @@ def test_c_default_keeps_everything():
     print("(c) 不配置该键 → 行为与原来一致  ✓")
 
 
+
+def test_d_local_authoritative_keys_merge():
+    """console 模式：manager 拉来的配置里没有这些键，本地文件说了算。"""
+    local_only = {
+        "server_plugins_exclude": ["get_lunar"],
+        "mcp_tool_call_timeout_sec": 5,
+        "asr_listen_timeout_quiet_sec": 2.5,
+        "asr_listen_timeout_max_sec": 45,
+        "asr_empty_min_frames": 12,
+        "llm_prefix_warmup_enabled": False,
+        "llm_prefix_warmup_debounce_sec": 0.8,
+    }
+    for key in local_only:
+        assert key in LOCAL_AUTHORITATIVE_KEYS, f"{key} 不在白名单里"
+
+    from_console = {
+        "selected_module": {"LLM": "EdgeLLM"},
+        "LLM": {"EdgeLLM": {"base_url": "http://console/v1"}},
+        "ASR": {"OVA": {"base_url": "http://console/asr"}},
+        "TTS": {"OVS": {"base_url": "http://console/tts"}},
+    }
+    local = dict(local_only)
+    # manager 管的段即使写在本地文件里也不该被合并进去
+    local["LLM"] = {"EdgeLLM": {"base_url": "http://local/v1"}}
+    local["ASR"] = {"OVA": {"base_url": "http://local/asr"}}
+
+    merged = apply_local_overrides(from_console, local)
+
+    for key, value in local_only.items():
+        assert merged.get(key) == value, (key, merged.get(key))
+    assert merged["LLM"]["EdgeLLM"]["base_url"] == "http://console/v1", merged["LLM"]
+    assert merged["ASR"]["OVA"]["base_url"] == "http://console/asr", merged["ASR"]
+    for seg in ("ASR", "TTS", "LLM", "selected_module"):
+        assert seg not in LOCAL_AUTHORITATIVE_KEYS, seg
+    print("(d) 本地权威键合并可见，ASR/TTS/LLM 仍由 console 说了算  ✓")
+
+
 if __name__ == "__main__":
     test_a_excludes_get_lunar()
     test_b_cannot_exclude_exit_intent()
     test_c_default_keeps_everything()
+    test_d_local_authoritative_keys_merge()
     print("\n全部通过 ✓")

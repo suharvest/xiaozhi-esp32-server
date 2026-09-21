@@ -30,6 +30,7 @@ from core.utils.modules_initialize import (
 from core.handle.reportHandle import report, enqueue_tool_report
 from core.providers.tts.default import DefaultTTS
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError as FuturesCancelledError
 from core.utils.dialogue import Message, Dialogue
 from core.providers.asr.dto.dto import InterfaceType
 from core.handle.textHandle import handleTextMessage
@@ -105,6 +106,8 @@ class ConnectionHandler:
         # LLM 前缀预热（见 _warm_llm_prefix）：去抖任务 + 互斥 + 真实请求计数
         self._llm_prefix_warmup_task = None
         self._llm_prefix_warmup_lock = threading.Lock()
+        # 锁忙而跳过的那次预热在这里留个标记，当前这次跑完再补一次（见 _warm_llm_prefix）
+        self._llm_prefix_warmup_pending = False
         self._llm_chat_active = 0
 
         self.need_bind = False  # 是否需要绑定设备
@@ -1329,9 +1332,14 @@ class ConnectionHandler:
                         # 使用公共方法上报工具调用结果
                         enqueue_tool_report(self, tool_call_data['name'], tool_input, str(result.result) if result.result else None, report_tool_call=False)
 
-                    except asyncio.CancelledError:
+                    except (asyncio.CancelledError, FuturesCancelledError):
                         # 设备断开会取消这些 future，错误信息恒为空。记 ERROR 只会
                         # 在日志里堆出一批没有内容的报错，掩盖真正的工具失败。
+                        # 这里等的是 concurrent.futures.Future（线程池的 future），
+                        # 取消时抛 concurrent.futures.CancelledError —— 它与
+                        # asyncio.CancelledError 是两个类，互不继承（3.11 实测：
+                        # issubclass(cf.CancelledError, asyncio.CancelledError) 为
+                        # False），只捕 asyncio 那个会漏到下面的 ERROR 分支。
                         self.logger.bind(tag=TAG).info(
                             f"工具调用被取消（设备断开）: {tool_call_data['name']}"
                         )
@@ -1471,9 +1479,11 @@ class ConnectionHandler:
 
         不写 dialogue、不进 TTS、不上报；任何异常只打 WARNING。
         """
+        if self.stop_event.is_set():
+            return
         if not self._llm_prefix_warmup_enabled():
             return
-        if self.stop_event.is_set() or self.llm is None:
+        if self.llm is None:
             return
         if getattr(self, "_llm_chat_active", 0) > 0:
             self.logger.bind(tag=TAG).debug(
@@ -1481,10 +1491,15 @@ class ConnectionHandler:
             )
             return
         if not self._llm_prefix_warmup_lock.acquire(blocking=False):
+            # 被跳过的这次往往带着新的工具列表。只丢掉它，前缀就再也捂不热了，
+            # 所以留个标记，等在跑的那次结束后补一次。
+            self._llm_prefix_warmup_pending = True
             self.logger.bind(tag=TAG).debug(
-                f"LLM prefix warmup ({reason}) 跳过：已有预热在跑"
+                f"LLM prefix warmup ({reason}) 跳过：已有预热在跑（已排队重试）"
             )
             return
+        # 这里不清 pending：标记是「有一次更新的工具列表被跳过了」，而当前这次
+        # 是更早排队的、可能拿的是旧列表。清除放在 finally 补跑的时候。
         try:
             from core.providers.llm.telemetry import compute_prefix_md5
 
@@ -1520,6 +1535,9 @@ class ConnectionHandler:
             self.logger.bind(tag=TAG).warning(f"LLM prefix warmup ({reason}) 失败: {e}")
         finally:
             self._llm_prefix_warmup_lock.release()
+            if getattr(self, "_llm_prefix_warmup_pending", False) and not self.stop_event.is_set():
+                self._llm_prefix_warmup_pending = False
+                self._schedule_llm_prefix_warmup("pending")
 
     @staticmethod
     def _llm_function_names(functions) -> set:
