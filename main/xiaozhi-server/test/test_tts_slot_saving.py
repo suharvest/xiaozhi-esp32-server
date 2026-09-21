@@ -23,7 +23,9 @@
   (g) 连续 429 时 _post_with_retry 总耗时 ≤3.5s 且返回 None；
   (h) to_tts 采集：返回非空 opus 帧列表，且 tts_audio_queue 保持为空
       （没有 FIRST/LAST 混进播放队列）；
-  (i) 采集期间 current_sentence_id != conn.sentence_id 不导致中止。
+  (i) 采集期间 current_sentence_id != conn.sentence_id 不导致中止；
+  (j) 流读取超时/连接关闭时按 self.timeout 退出，不无限空转占着会话槽；
+  (k) 正常流不受 (j) 的 deadline 影响。
 """
 import asyncio
 import os
@@ -470,6 +472,113 @@ def test_i_collect_ignores_round():
         ovs.aiohttp = real_aiohttp
 
 
+
+# --------------------------------------------------------------------------
+# j/k：流读取超时不再空转（aiohttp 的 total 到期会持续抛 TimeoutError）
+# --------------------------------------------------------------------------
+class EofContent:
+    """吐完 chunks 就 EOF（返回 b""），模拟一条正常结束的流。"""
+
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+
+    async def readany(self):
+        if self.chunks:
+            return self.chunks.pop(0)
+        return b""
+
+    def at_eof(self):
+        return not self.chunks
+
+
+class AlwaysTimeoutContent:
+    """每次 readany 都抛 asyncio.TimeoutError（aiohttp total 到期后的行为）。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def readany(self):
+        self.calls += 1
+        raise asyncio.TimeoutError()
+
+
+def test_j_read_timeout_breaks_out():
+    real_aiohttp = ovs.aiohttp
+    try:
+        for name, content in (
+            ("readany 永远挂起", None),
+            ("readany 持续抛 TimeoutError", AlwaysTimeoutContent()),
+        ):
+            p = make_provider(timeout=1.0)
+            sid = uuid.uuid4().hex
+            p.current_sentence_id = sid
+            p.conn.sentence_id = sid
+            enc = FakeEncoder()
+            p._ensure_encoder = lambda sr, _p=p, _e=enc: setattr(_p, "opus_encoder", _e)
+
+            def factory(_c=content):
+                r = FakeResp([])
+                if _c is not None:
+                    r.content = _c
+                return r
+
+            _install_fake_aiohttp(factory)
+
+            async def run():
+                t0 = time.monotonic()
+                result = await asyncio.wait_for(
+                    p.text_to_speak("测试文本"), timeout=5.0
+                )
+                return result, time.monotonic() - t0
+
+            result, elapsed = asyncio.run(run())
+
+            assert result is False, f"{name}: 应返回 False，得到 {result}"
+            assert 0.9 <= elapsed < 1.6, f"{name}: 耗时 {elapsed:.2f}s 不在 1.0~1.5s"
+            assert not p._synth_lock.locked(), f"{name}: 锁未释放"
+            assert enc.frames == 0, f"{name}: 不该编码出音频帧"
+            assert not enc.flushed, f"{name}: 中止后仍 flush 了尾音"
+            assert len(p.pcm_buffer) == 0, f"{name}: pcm_buffer 未清"
+            drained = []
+            while not p.tts_audio_queue.empty():
+                drained.append(p.tts_audio_queue.get()[0])
+            assert SentenceType.LAST not in drained, f"{name}: 超时路径不应入队 LAST"
+            print(f"(j) 读取超时：{name} 在 {elapsed:.2f}s 内退出  ✓")
+    finally:
+        ovs.aiohttp = real_aiohttp
+
+
+def test_k_normal_stream_unaffected():
+    import struct
+
+    real_aiohttp = ovs.aiohttp
+    try:
+        p = make_provider(timeout=1.0)
+        sid = uuid.uuid4().hex
+        p.current_sentence_id = sid
+        p.conn.sentence_id = sid
+        enc = FakeEncoder()
+        p._ensure_encoder = lambda sr, _p=p, _e=enc: setattr(_p, "opus_encoder", _e)
+
+        def factory():
+            r = FakeResp([])
+            r.content = EofContent(
+                [struct.pack("<I", 16000) + b"\x01" * 1920, b"\x02" * 1920]
+            )
+            return r
+
+        _install_fake_aiohttp(factory)
+
+        result = asyncio.run(p.text_to_speak("测试文本", is_last=False))
+
+        assert result is True, f"正常流应返回 True，得到 {result}"
+        assert enc.frames >= 2, enc.frames
+        assert len(p.pcm_buffer) == 0, len(p.pcm_buffer)
+        print(f"(k) 正常流不受影响：编码 {enc.frames} 帧、返回 True  ✓")
+    finally:
+        ovs.aiohttp = real_aiohttp
+
+
 if __name__ == "__main__":
     test_a_first_sentence_early()
     test_b_threshold()
@@ -480,4 +589,6 @@ if __name__ == "__main__":
     test_g_retry_budget()
     test_h_to_tts_collect()
     test_i_collect_ignores_round()
+    test_j_read_timeout_breaks_out()
+    test_k_normal_stream_unaffected()
     print("\n全部通过 ✓")

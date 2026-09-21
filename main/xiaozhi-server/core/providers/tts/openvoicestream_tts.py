@@ -16,6 +16,34 @@ TAG = __name__
 logger = setup_logging()
 
 
+def _content_at_eof(resp) -> bool:
+    """响应体是否已读完。aiohttp 3.x 的 StreamReader 有 at_eof()；测试替身没有。"""
+    content = getattr(resp, "content", None)
+    at_eof = getattr(content, "at_eof", None)
+    if at_eof is None:
+        return False
+    try:
+        return bool(at_eof())
+    except Exception:
+        return False
+
+
+def _connection_gone(resp) -> bool:
+    """底层连接是否已经没了（aiohttp 3.x：response.closed / response.connection）。"""
+    try:
+        if getattr(resp, "closed", False):
+            return True
+    except Exception:
+        pass
+    try:
+        # 连接释放后 connection 变 None；测试替身没有这个属性，缺省当作「还在」。
+        if hasattr(resp, "connection") and resp.connection is None:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _to_optional_int(v) -> Optional[int]:
     """Coerce a config value to int, or return None for empty/invalid."""
     if v is None:
@@ -516,7 +544,15 @@ class TTSProvider(TTSProviderBase):
             return False
 
         try:
-            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            # 整体上限由下面的 deadline 管，不交给 aiohttp：`total` 到期后
+            # aiohttp 的 TimerContext 会对之后每一次 await 持续抛
+            # asyncio.TimeoutError，与我们 250ms 轮询用的超时无法区分，
+            # 会被当成「还没数据」无限 continue（见下方 deadline 分支）。
+            timeout = aiohttp.ClientTimeout(
+                total=None,
+                sock_connect=min(5, self.timeout),
+                sock_read=self.timeout,
+            )
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 resp = await self._post_with_retry(session, payload, stopped=_stopped)
                 if resp is None:
@@ -548,6 +584,8 @@ class TTSProvider(TTSProviderBase):
                     # 用带短超时的轮询读代替 `async for`：后者会一直挂在
                     # readany() 上，设备断开后仍把整句合成完才释放会话槽。
                     aborted = False
+                    loop = asyncio.get_event_loop()
+                    deadline = loop.time() + self.timeout
                     while True:
                         if _stopped():
                             aborted = True
@@ -557,6 +595,20 @@ class TTSProvider(TTSProviderBase):
                                 resp.content.readany(), timeout=0.25
                             )
                         except asyncio.TimeoutError:
+                            # 只有「这 250ms 内没来数据」才该 continue。整体超时
+                            # 到点、流已 EOF、连接已断三种情况必须退出，否则这条
+                            # 循环会一直空转并占着 _synth_lock 与 OVS 会话槽。
+                            if (
+                                loop.time() >= deadline
+                                or _content_at_eof(resp)
+                                or _connection_gone(resp)
+                            ):
+                                logger.bind(tag=TAG).warning(
+                                    "TTS 流读取超时/连接已关闭，放弃本次合成"
+                                    f"（timeout={self.timeout}s）"
+                                )
+                                aborted = True
+                                break
                             continue
                         data = chunk[0] if isinstance(chunk, (list, tuple)) else chunk
                         if not data:
