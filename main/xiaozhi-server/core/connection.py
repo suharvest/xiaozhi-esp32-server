@@ -30,6 +30,7 @@ from core.utils.modules_initialize import (
 from core.handle.reportHandle import report, enqueue_tool_report
 from core.providers.tts.default import DefaultTTS
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError as FuturesCancelledError
 from core.utils.dialogue import Message, Dialogue
 from core.providers.asr.dto.dto import InterfaceType
 from core.handle.textHandle import handleTextMessage
@@ -97,6 +98,17 @@ class ConnectionHandler:
         # 给出任何可播报结论"，由 chat() 在 depth==0 收尾时消费。
         self._pending_tool_answer = False
         self._last_tool_result_text = None
+
+        # LLM 前缀缓存遥测：上一次调用的前缀指纹与工具数（见 _note_llm_prefix）
+        self._llm_prefix_last_md5 = None
+        self._llm_prefix_last_tools = None
+        self._llm_prefix_last_tool_names = None
+        # LLM 前缀预热（见 _warm_llm_prefix）：去抖任务 + 互斥 + 真实请求计数
+        self._llm_prefix_warmup_task = None
+        self._llm_prefix_warmup_lock = threading.Lock()
+        # 锁忙而跳过的那次预热在这里留个标记，当前这次跑完再补一次（见 _warm_llm_prefix）
+        self._llm_prefix_warmup_pending = False
+        self._llm_chat_active = 0
 
         self.need_bind = False  # 是否需要绑定设备
         self.bind_completed_event = asyncio.Event()
@@ -654,6 +666,8 @@ class ConnectionHandler:
             self._init_prompt_enhancement()
             """注入工具调用few-shot示例（仅function_call模式）"""
             self._inject_tool_call_fewshot()
+            """连接就绪：预热 EdgeLLM 的前缀 KV 缓存"""
+            self._schedule_llm_prefix_warmup("connection_ready")
 
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"实例化组件失败: {e}")
@@ -1044,6 +1058,16 @@ class ConnectionHandler:
         if query is not None:
             self.logger.bind(tag=TAG).info(f"大模型收到用户消息: {query}")
 
+        # 真实请求在跑时不做前缀预热（真实请求本身就会把前缀捂热）
+        # getattr 兜底：单测会绕过 __init__ 直接构造 ConnectionHandler
+        self._llm_chat_active = getattr(self, "_llm_chat_active", 0) + 1
+        try:
+            return self._chat_inner(query, depth, current_sentence_id)
+        finally:
+            self._llm_chat_active = max(0, getattr(self, "_llm_chat_active", 1) - 1)
+
+    def _chat_inner(self, query, depth=0, current_sentence_id=None):
+
         # 为最顶层时新建会话ID和发送FIRST请求
         if depth == 0:
             current_sentence_id = str(uuid.uuid4().hex)
@@ -1052,6 +1076,9 @@ class ConnectionHandler:
             self._pending_tool_answer = False
             self._last_tool_result_text = None
             self.dialogue.put(Message(role="user", content=query))
+            # A1：新一轮开始，把超出保真窗口（最近 tool_result_raw_turns 轮）的
+            # 历史 tool 结果就地压缩；窗口内与上报路径不受影响
+            self._compress_tool_results_outside_raw_window()
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
                     sentence_id=current_sentence_id,
@@ -1082,18 +1109,9 @@ class ConnectionHandler:
             )
 
         # Define intent functions
-        functions = None
-        # 达到最大深度时，禁用工具调用，强制 LLM 直接回答
-        if (
-                self.intent_type == "function_call"
-                and hasattr(self, "func_handler")
-                and not force_final_answer
-        ):
-            functions = list(self.func_handler.get_functions())
-            # 仅在第一层调用时注入 direct_answer 虚拟工具
-            # 递归调用（depth>0）不注入，避免模型在生成文本回复时再次调 direct_answer 导致循环
-            if functions is not None and depth == 0:
-                functions.append(DIRECT_ANSWER_TOOL)
+        # 达到最大深度时（force_final_answer）禁用工具调用，强制 LLM 直接回答；
+        # 其余深度一律用同一份工具列表，见 _build_llm_functions() 的说明。
+        functions = self._build_llm_functions(force_final_answer=force_final_answer)
 
         response_message = []
 
@@ -1117,126 +1135,44 @@ class ConnectionHandler:
                 self.system_introduced_speakers.add(cs)
                 speaker_for_system = cs
 
-            if self.intent_type == "function_call" and functions is not None:
-                # 使用支持functions的streaming接口
-                llm_responses = self.llm.response_with_functions(
-                    self.session_id,
-                    self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str,
-                        self.config.get("voiceprint", {}),
-                        current_speaker=speaker_for_system,
-                        max_history_turns=max_history_turns,
-                    ),
-                    functions=functions,
-                )
-            else:
-                llm_responses = self.llm.response(
-                    self.session_id,
-                    self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str,
-                        self.config.get("voiceprint", {}),
-                        current_speaker=speaker_for_system,
-                        max_history_turns=max_history_turns,
-                    ),
-                )
+            messages_for_llm = self.dialogue.get_llm_dialogue_with_memory(
+                memory_str,
+                self.config.get("voiceprint", {}),
+                current_speaker=speaker_for_system,
+                max_history_turns=max_history_turns,
+            )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
             return None
 
-        # 处理流式响应
-        tool_call_flag = False
-        # 支持多个并行工具调用 - 使用列表存储
-        tool_calls_list = []  # 格式: [{"id": "", "name": "", "arguments": ""}]
-        content_arguments = ""
-        emotion_flag = True
+        # 前缀指纹变化告警：直接回答「这一轮为什么没命中 EdgeLLM 的 KV 前缀缓存」
+        self._note_llm_prefix(messages_for_llm, functions)
+
+        # 处理流式响应（含 input_too_long 自动裁剪重试与异常兜底播报）
         try:
-            for response in llm_responses:
-                if self.client_abort:
-                    break
-                if self.intent_type == "function_call" and functions is not None:
-                    content, tools_call = response
-                    if "content" in response:
-                        content = response["content"]
-                        tools_call = None
-                    if content is not None and len(content) > 0:
-                        content_arguments += content
-
-                    if not tool_call_flag and content_arguments.startswith("<tool_call>"):
-                        # print("content_arguments", content_arguments)
-                        tool_call_flag = True
-
-                    if tools_call is not None and len(tools_call) > 0:
-                        tool_call_flag = True
-                        self._merge_tool_calls(tool_calls_list, tools_call)
-
-                    # 流式提取 direct_answer 的 response 参数，实时送 TTS
-                    # 使用安全缓冲区，防止 JSON 闭合符号泄漏到 TTS
-                    _DA_STREAM_BUFFER = 5
-                    for tc in tool_calls_list:
-                        if tc["name"] == "direct_answer" and tc.get("arguments"):
-                            da_text = self._extract_direct_answer_response(tc["arguments"])
-                            sent_len = tc.get("_da_sent", 0)
-                            if da_text and len(da_text) > sent_len:
-                                safe_end = max(sent_len, len(da_text) - _DA_STREAM_BUFFER)
-                                if safe_end > sent_len:
-                                    new_part = da_text[sent_len:safe_end]
-                                    # 清理 delta 中可能泄漏的 JSON 闭合垃圾
-                                    new_part = self._clean_response_garbage(new_part)
-                                    if new_part:
-                                        tc["_da_sent"] = safe_end
-                                        self._pending_tool_answer = False
-                                        self.tts.tts_text_queue.put(
-                                            TTSMessageDTO(
-                                                sentence_id=current_sentence_id,
-                                                sentence_type=SentenceType.MIDDLE,
-                                                content_type=ContentType.TEXT,
-                                                content_detail=new_part,
-                                            )
-                                        )
-                else:
-                    content = response
-
-                # 在llm回复中获取情绪表情，一轮对话只在开头获取一次
-                if emotion_flag and content is not None and content.strip():
-                    if (self.features or {}).get("emoji", True):
-                        asyncio.run_coroutine_threadsafe(
-                            textUtils.get_emotion(self, content),
-                            self.loop,
-                        )
-                    emotion_flag = False
-
-                if content is not None and len(content) > 0:
-                    if not tool_call_flag:
-                        response_message.append(content)
-                        self._pending_tool_answer = False
-                        self.tts.tts_text_queue.put(
-                            TTSMessageDTO(
-                                sentence_id=current_sentence_id,
-                                sentence_type=SentenceType.MIDDLE,
-                                content_type=ContentType.TEXT,
-                                content_detail=content,
-                            )
-                        )
+            stream = self._run_llm_stream_with_overflow_retry(
+                messages_for_llm, functions, current_sentence_id, depth
+            )
         except Exception as e:
+            # 非上下文超限的 LLM 异常：FIRST+LAST 兜底播报（单句 MIDDLE 设备不播）
             self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
             self._pending_tool_answer = False
-            self.tts.tts_text_queue.put(
-                TTSMessageDTO(
-                    sentence_id=current_sentence_id,
-                    sentence_type=SentenceType.MIDDLE,
-                    content_type=ContentType.TEXT,
-                    content_detail=get_system_error_response(self.config),
-                )
+            self._speak_llm_fallback(
+                self.config.get("llm_error_reply")
+                or get_system_error_response(self.config),
+                current_sentence_id,
+                close_previous=(depth == 0),
             )
-            if depth == 0:
-                self.tts.tts_text_queue.put(
-                    TTSMessageDTO(
-                        sentence_id=current_sentence_id,
-                        sentence_type=SentenceType.LAST,
-                        content_type=ContentType.ACTION,
-                    )
-                )
             return
+        if stream is None:
+            # 上下文超限且裁剪重试仍失败：兜底话术已播报、上下文已清空
+            self._pending_tool_answer = False
+            return
+
+        response_message = stream["response_message"]
+        tool_call_flag = stream["tool_call_flag"]
+        tool_calls_list = stream["tool_calls_list"]
+        content_arguments = stream["content_arguments"]
         # 处理function call
         if tool_call_flag:
             bHasError = False
@@ -1297,6 +1233,9 @@ class ConnectionHandler:
                             da_response = self._clean_response_garbage(da_response)
                             self.tts.store_tts_text(current_sentence_id, da_response)
                             self.dialogue.put(Message(role="assistant", content=da_response))
+                            # 结论已给出：清掉工具兜底欠账，避免 depth==0 收尾再补一句
+                            # （答案短于流式安全缓冲区时，流式那段来不及清）
+                            self._pending_tool_answer = False
 
                     if not real_tool_calls:
                         if depth == 0:
@@ -1393,6 +1332,22 @@ class ConnectionHandler:
                         # 使用公共方法上报工具调用结果
                         enqueue_tool_report(self, tool_call_data['name'], tool_input, str(result.result) if result.result else None, report_tool_call=False)
 
+                    except (asyncio.CancelledError, FuturesCancelledError):
+                        # 设备断开会取消这些 future，错误信息恒为空。记 ERROR 只会
+                        # 在日志里堆出一批没有内容的报错，掩盖真正的工具失败。
+                        # 这里等的是 concurrent.futures.Future（线程池的 future），
+                        # 取消时抛 concurrent.futures.CancelledError —— 它与
+                        # asyncio.CancelledError 是两个类，互不继承（3.11 实测：
+                        # issubclass(cf.CancelledError, asyncio.CancelledError) 为
+                        # False），只捕 asyncio 那个会漏到下面的 ERROR 分支。
+                        self.logger.bind(tag=TAG).info(
+                            f"工具调用被取消（设备断开）: {tool_call_data['name']}"
+                        )
+                        tool_results.append((
+                            ActionResponse(action=Action.ERROR, result="哎呀，网络遇到点问题，请稍后再试下！"),
+                            tool_call_data
+                        ))
+                        enqueue_tool_report(self, tool_call_data['name'], tool_input, "cancelled", report_tool_call=False)
                     except Exception as e:
                         self.logger.bind(tag=TAG).error(
                             f"工具调用超时或异常: {tool_call_data['name']}, 错误: {e}"
@@ -1458,6 +1413,631 @@ class ConnectionHandler:
             )
 
         return True
+
+    # ------------------------------------------------------------------
+    # A2/A3 LLM 调用与兜底
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # LLM 前缀预热（EdgeLLM KV 前缀缓存）
+    # ------------------------------------------------------------------
+    def _llm_prefix_warmup_enabled(self) -> bool:
+        return bool(self.config.get("llm_prefix_warmup_enabled", True))
+
+    def _llm_prefix_warmup_debounce(self) -> float:
+        try:
+            value = float(self.config.get("llm_prefix_warmup_debounce_sec", 1.5))
+        except (TypeError, ValueError):
+            value = 1.5
+        return value if value >= 0 else 1.5
+
+    def _schedule_llm_prefix_warmup(self, reason: str):
+        """去抖调度一次前缀预热。
+
+        工具列表是分批到达的（设备 MCP 每批一次 refresh_tools、MCP 接入点就绪
+        一次），每批都预热等于每批都重算一遍 prefill。这里只保留最后一次变化后
+        `llm_prefix_warmup_debounce_sec` 秒的那一次。
+        """
+        if not self._llm_prefix_warmup_enabled():
+            return
+        loop = getattr(self, "loop", None)
+        if loop is None:
+            return
+
+        def _arm():
+            try:
+                task = self._llm_prefix_warmup_task
+                if task is not None and not task.done():
+                    task.cancel()
+                self._llm_prefix_warmup_task = loop.create_task(
+                    self._llm_prefix_warmup_later(
+                        self._llm_prefix_warmup_debounce(), reason
+                    )
+                )
+            except Exception as e:
+                self.logger.bind(tag=TAG).debug(f"前缀预热调度失败: {e}")
+
+        try:
+            loop.call_soon_threadsafe(_arm)
+        except Exception as e:
+            self.logger.bind(tag=TAG).debug(f"前缀预热调度失败: {e}")
+
+    async def _llm_prefix_warmup_later(self, delay: float, reason: str):
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        try:
+            await asyncio.to_thread(self._warm_llm_prefix, reason)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger.bind(tag=TAG).warning(f"LLM prefix warmup ({reason}) 失败: {e}")
+
+    def _warm_llm_prefix(self, reason: str):
+        """用与 chat() 相同的前缀发一次 max_tokens=1 的请求，把 KV 前缀捂热。
+
+        不写 dialogue、不进 TTS、不上报；任何异常只打 WARNING。
+        """
+        if self.stop_event.is_set():
+            return
+        if not self._llm_prefix_warmup_enabled():
+            return
+        if self.llm is None:
+            return
+        if getattr(self, "_llm_chat_active", 0) > 0:
+            self.logger.bind(tag=TAG).debug(
+                f"LLM prefix warmup ({reason}) 跳过：本轮对话正在进行"
+            )
+            return
+        if not self._llm_prefix_warmup_lock.acquire(blocking=False):
+            # 被跳过的这次往往带着新的工具列表。只丢掉它，前缀就再也捂不热了，
+            # 所以留个标记，等在跑的那次结束后补一次。
+            self._llm_prefix_warmup_pending = True
+            self.logger.bind(tag=TAG).debug(
+                f"LLM prefix warmup ({reason}) 跳过：已有预热在跑（已排队重试）"
+            )
+            return
+        # 这里不清 pending：标记是「有一次更新的工具列表被跳过了」，而当前这次
+        # 是更早排队的、可能拿的是旧列表。清除放在 finally 补跑的时候。
+        try:
+            from core.providers.llm.telemetry import compute_prefix_md5
+
+            # 必须与 chat() 用同一份构造，否则预热出来的前缀对不上真实请求
+            functions = self._build_llm_functions()
+
+            # 前缀 = 静态 system + few-shot + 动态 system，不含任何真实对话消息
+            messages = self.dialogue.get_llm_dialogue_with_memory(
+                None,
+                self.config.get("voiceprint", {}),
+                current_speaker=None,
+                max_history_turns=0,
+                include_history=False,
+            )
+            # 末尾补一条极短用户消息：OpenAI 兼容服务端一般不接受以 system 收尾
+            messages = messages + [{"role": "user", "content": "。"}]
+
+            started = time.time()
+            if functions is not None:
+                stream = self.llm.response_with_functions(
+                    self.session_id, messages, functions=functions, max_tokens=1
+                )
+            else:
+                stream = self.llm.response(self.session_id, messages, max_tokens=1)
+            for _ in stream:
+                pass
+            self.logger.bind(tag=TAG).info(
+                f"LLM prefix warmup ({reason}): "
+                f"prefix={compute_prefix_md5(messages, functions)} "
+                f"tools={len(functions or [])} took={time.time() - started:.2f}s"
+            )
+        except Exception as e:
+            self.logger.bind(tag=TAG).warning(f"LLM prefix warmup ({reason}) 失败: {e}")
+        finally:
+            self._llm_prefix_warmup_lock.release()
+            if getattr(self, "_llm_prefix_warmup_pending", False) and not self.stop_event.is_set():
+                self._llm_prefix_warmup_pending = False
+                self._schedule_llm_prefix_warmup("pending")
+
+    @staticmethod
+    def _llm_function_names(functions) -> set:
+        """工具名集合，用于前缀变化日志里的 added/removed 差集。"""
+        names = set()
+        for f in functions or []:
+            try:
+                name = (f.get("function") or {}).get("name")
+            except AttributeError:
+                name = None
+            if name:
+                names.add(name)
+        return names
+
+    def _note_llm_prefix(self, messages, functions):
+        """比对本次与上次的前缀指纹，变化时打 INFO。
+
+        EdgeLLM 只缓存开头 system 块（静态 system prompt + tools）的 KV；指纹一变
+        就是整段重新 prefill（实测 9~13s，设备 ~10s 收不到音频就断线）。工具列表
+        分批到达、系统提示词被改写都会让它变，这条日志把「为什么变」摊开。
+        """
+        try:
+            from core.providers.llm.telemetry import compute_prefix_md5
+
+            md5 = compute_prefix_md5(messages, functions)
+            n_tools = len(functions or [])
+            names = self._llm_function_names(functions)
+            if self._llm_prefix_last_md5 is not None and md5 != self._llm_prefix_last_md5:
+                prev = self._llm_prefix_last_tool_names
+                added = sorted(names - prev) if prev is not None else []
+                removed = sorted(prev - names) if prev is not None else []
+                self.logger.bind(tag=TAG).info(
+                    f"LLM prefix changed: {self._llm_prefix_last_md5}->{md5} "
+                    f"(tools {self._llm_prefix_last_tools}->{n_tools}) "
+                    f"added={added} removed={removed}"
+                )
+            self._llm_prefix_last_md5 = md5
+            self._llm_prefix_last_tools = n_tools
+            self._llm_prefix_last_tool_names = names
+        except Exception as e:
+            self.logger.bind(tag=TAG).debug(f"前缀指纹记录失败: {e}")
+
+    def _build_llm_functions(self, force_final_answer: bool = False):
+        """构造送给 LLM 的 functions 列表；chat() 与前缀预热共用同一份构造。
+
+        DIRECT_ANSWER_TOOL 在**所有深度**都追加在末尾，保证同一连接内 functions
+        逐字一致。EdgeLLM 只缓存「静态 system + tools」这段前缀，工具 JSON 少一个
+        条目就整段重算 prefill —— 现场日志里 depth==0 那轮 ttft=0.55s（29 个工具、
+        前缀命中），工具结果那轮少了 direct_answer（28 个工具）前缀立刻失配，
+        ttft 涨到 2.37s，下一轮又变回 29 个，来回把缓存打翻。
+
+        depth>0 也注入不会导致循环：direct_answer 的处理是「流式播报 + 写对话历史
+        + return」（见 chat() 的 direct_answer_calls 分支），不会递归回 chat()。
+
+        force_final_answer（撞到 MAX_DEPTH）时返回 None，行为与原来一致。
+        """
+        if force_final_answer:
+            return None
+        if self.intent_type != "function_call":
+            return None
+        if getattr(self, "func_handler", None) is None:
+            return None
+        functions = list(self.func_handler.get_functions() or [])
+        functions.append(DIRECT_ANSWER_TOOL)
+        return functions
+
+    def _invoke_llm(self, messages, functions):
+        """按意图类型调用 LLM（流式）。错误可能在调用时或首次迭代时抛出。"""
+        if self.intent_type == "function_call" and functions is not None:
+            return self.llm.response_with_functions(
+                self.session_id, messages, functions=functions
+            )
+        return self.llm.response(self.session_id, messages)
+
+    def _consume_llm_stream(self, llm_responses, functions, current_sentence_id):
+        """消费 LLM 流式响应，返回状态 dict。异常原样向上抛（由调用方分类处理）。"""
+        response_message = []
+        tool_call_flag = False
+        # 支持多个并行工具调用 - 使用列表存储
+        tool_calls_list = []  # 格式: [{"id": "", "name": "", "arguments": ""}]
+        content_arguments = ""
+        emotion_flag = True
+        for response in llm_responses:
+            if self.client_abort:
+                break
+            if self.intent_type == "function_call" and functions is not None:
+                content, tools_call = response
+                if "content" in response:
+                    content = response["content"]
+                    tools_call = None
+                if content is not None and len(content) > 0:
+                    content_arguments += content
+
+                if not tool_call_flag and content_arguments.startswith("<tool_call>"):
+                    # print("content_arguments", content_arguments)
+                    tool_call_flag = True
+
+                if tools_call is not None and len(tools_call) > 0:
+                    tool_call_flag = True
+                    self._merge_tool_calls(tool_calls_list, tools_call)
+
+                # 流式提取 direct_answer 的 response 参数，实时送 TTS
+                # 使用安全缓冲区，防止 JSON 闭合符号泄漏到 TTS
+                _DA_STREAM_BUFFER = 5
+                for tc in tool_calls_list:
+                    if tc["name"] == "direct_answer" and tc.get("arguments"):
+                        da_text = self._extract_direct_answer_response(tc["arguments"])
+                        sent_len = tc.get("_da_sent", 0)
+                        if da_text and len(da_text) > sent_len:
+                            safe_end = max(sent_len, len(da_text) - _DA_STREAM_BUFFER)
+                            if safe_end > sent_len:
+                                new_part = da_text[sent_len:safe_end]
+                                # 清理 delta 中可能泄漏的 JSON 闭合垃圾
+                                new_part = self._clean_response_garbage(new_part)
+                                if new_part:
+                                    tc["_da_sent"] = safe_end
+                                    self._pending_tool_answer = False
+                                    self.tts.tts_text_queue.put(
+                                        TTSMessageDTO(
+                                            sentence_id=current_sentence_id,
+                                            sentence_type=SentenceType.MIDDLE,
+                                            content_type=ContentType.TEXT,
+                                            content_detail=new_part,
+                                        )
+                                    )
+            else:
+                content = response
+
+            # 在llm回复中获取情绪表情，一轮对话只在开头获取一次
+            if emotion_flag and content is not None and content.strip():
+                if (self.features or {}).get("emoji", True):
+                    asyncio.run_coroutine_threadsafe(
+                        textUtils.get_emotion(self, content),
+                        self.loop,
+                    )
+                emotion_flag = False
+
+            if content is not None and len(content) > 0:
+                if not tool_call_flag:
+                    response_message.append(content)
+                    self._pending_tool_answer = False
+                    self.tts.tts_text_queue.put(
+                        TTSMessageDTO(
+                            sentence_id=current_sentence_id,
+                            sentence_type=SentenceType.MIDDLE,
+                            content_type=ContentType.TEXT,
+                            content_detail=content,
+                        )
+                    )
+        return {
+            "response_message": response_message,
+            "tool_call_flag": tool_call_flag,
+            "tool_calls_list": tool_calls_list,
+            "content_arguments": content_arguments,
+        }
+
+    def _run_llm_stream_with_overflow_retry(
+        self, messages, functions, current_sentence_id, depth
+    ):
+        """调 LLM 并消费流；遇 input_too_long 确定性裁剪后重试一次。
+
+        返回状态 dict；返回 None 表示重试仍失败、兜底话术已播报且上下文已清空，
+        调用方直接 return。其它异常原样上抛（由 chat() 的统一异常分支兜底播报）。
+        最多重试一次，绝不循环。
+        """
+        try:
+            llm_responses = self._invoke_llm(messages, functions)
+            return self._consume_llm_stream(
+                llm_responses, functions, current_sentence_id
+            )
+        except Exception as e:
+            err = str(e)
+            if "input_too_long" not in err:
+                raise
+            # 可 grep 的 WARNING：含 got_tokens/max 数字（原文保留）
+            self.logger.bind(tag=TAG).warning(
+                f"上下文超限: {err}；裁剪上下文后重试一次"
+            )
+            pruned = self._prune_messages_for_overflow_retry(messages)
+            try:
+                llm_responses = self._invoke_llm(pruned, functions)
+                return self._consume_llm_stream(
+                    llm_responses, functions, current_sentence_id
+                )
+            except Exception as e2:
+                self.logger.bind(tag=TAG).warning(
+                    f"上下文超限: 裁剪重试仍失败（{e2}），清空会话上下文并播报兜底话术"
+                )
+                self._clear_dialogue_context()
+                reply = self.config.get(
+                    "llm_context_overflow_reply", "信息太多，我先清一下，请再说一遍"
+                )
+                if reply:
+                    self._speak_llm_fallback(
+                        reply, current_sentence_id, close_previous=(depth == 0)
+                    )
+                return None
+
+    def _prune_messages_for_overflow_retry(self, messages):
+        """input_too_long 时的确定性裁剪（不依赖 tokenizer）。
+
+        只保留：system 提示 + 最近 2 轮 user 对话 + 最近一次工具结果
+        （及其配对的 assistant.tool_calls，内容已按 A1 压缩）；
+        其余工具消息与更早历史全部删除。裁剪后重新对齐 tool_calls/tool
+        配对，保证 OpenAI 工具调用协议完整。
+        """
+        systems = [m for m in messages if m.get("role") == "system"]
+        body = [m for m in messages if m.get("role") != "system"]
+
+        # 最近 2 轮 user
+        user_idx = [i for i, m in enumerate(body) if m.get("role") == "user"]
+        if len(user_idx) > 2:
+            body = body[user_idx[-2]:]
+
+        # 仅保留最近一次工具交互（最后一个带 tool_calls 的 assistant 及其后的 tool）
+        last_tc = None
+        for i, m in enumerate(body):
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                last_tc = i
+        pruned_body = []
+        for i, m in enumerate(body):
+            role = m.get("role")
+            if role == "assistant" and m.get("tool_calls"):
+                if i == last_tc:
+                    pruned_body.append(m)
+                continue
+            if role == "tool":
+                if last_tc is not None and i > last_tc:
+                    pruned_body.append(m)
+                continue
+            pruned_body.append(m)
+
+        # 协议对齐：孤儿 tool 丢弃，悬空 tool_calls 补 interrupted 响应
+        known_ids = set()
+        for m in pruned_body:
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    tc_id = tc.get("id")
+                    if tc_id:
+                        known_ids.add(tc_id)
+        fixed = []
+        pending = []
+        for m in pruned_body:
+            if m.get("role") == "tool":
+                if m.get("tool_call_id") not in known_ids:
+                    continue
+                fixed.append(m)
+                if m.get("tool_call_id") in pending:
+                    pending.remove(m.get("tool_call_id"))
+                continue
+            fixed.append(m)
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    if tc.get("id"):
+                        pending.append(tc["id"])
+        for missing in pending:
+            fixed.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": missing,
+                    "content": '{"status": "interrupted", "message": "动作已取消/被打断"}',
+                }
+            )
+        self.logger.bind(tag=TAG).warning(
+            f"上下文超限裁剪: 原 {len(messages)} 条 → {len(systems) + len(fixed)} 条"
+        )
+        return systems + fixed
+
+    def _clear_dialogue_context(self):
+        """上下文超限兜底：清空会话历史（保留 system 提示与 few-shot 模板）。"""
+        try:
+            keep = [
+                m
+                for m in self.dialogue.dialogue
+                if m.role == "system" or m.is_temporary
+            ]
+            dropped = len(self.dialogue.dialogue) - len(keep)
+            self.dialogue.dialogue = keep
+            self.logger.bind(tag=TAG).warning(
+                f"上下文超限: 已清空会话历史 {dropped} 条"
+            )
+        except Exception as e:
+            self.logger.bind(tag=TAG).warning(f"清空会话上下文失败: {e}")
+
+    def _speak_llm_fallback(self, phrase, current_sentence_id=None, close_previous=False):
+        """LLM 异常/上下文超限的兜底播报：FIRST+LAST 单独成句。
+
+        写法与 asr/base.py::_speak_fallback_phrase 一致（已验证单句 MIDDLE
+        设备不播、也不回待命）。任何异常只打 warning，绝不能让 chat() 崩。
+        close_previous=True（depth==0）时给本轮已发过 FIRST 的旧 sentence
+        补一条 LAST 收尾，避免设备一直等。
+        """
+        try:
+            if getattr(self, "client_abort", False):
+                self.logger.bind(tag=TAG).info("用户已打断，跳过LLM兜底播报")
+                return
+            if self.stop_event.is_set():
+                return
+            sid = str(uuid.uuid4().hex)
+            self.sentence_id = sid
+            self.tts.store_tts_text(sid, phrase)
+            self.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=sid,
+                    sentence_type=SentenceType.FIRST,
+                    content_type=ContentType.ACTION,
+                )
+            )
+            self.tts.tts_one_sentence(self, ContentType.TEXT, content_detail=phrase)
+            self.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=sid,
+                    sentence_type=SentenceType.LAST,
+                    content_type=ContentType.ACTION,
+                )
+            )
+            if close_previous and current_sentence_id and current_sentence_id != sid:
+                self.tts.tts_text_queue.put(
+                    TTSMessageDTO(
+                        sentence_id=current_sentence_id,
+                        sentence_type=SentenceType.LAST,
+                        content_type=ContentType.ACTION,
+                    )
+                )
+        except Exception as e:
+            self.logger.bind(tag=TAG).warning(f"LLM兜底播报失败: {e}")
+
+    # ------------------------------------------------------------------
+    # A1 工具结果上下文压缩（保真窗口版）
+    #   - 只作用于「喂给 LLM 的 role="tool" 消息内容」，挂点仅限
+    #     _handle_function_result() 的两个写 tool 消息分支；
+    #   - enqueue_tool_report() 走的仍是原始结果，控制台/记忆不受影响；
+    #   - 保真窗口 = 最近 tool_result_raw_turns 轮（默认 2 轮，user→assistant
+    #     为一轮）：窗口内 tool 内容逐字保留；单条超宽松上限
+    #     tool_result_latest_max_chars（默认 4000）时只剥离巨型数组，say 全文保留；
+    #   - 窗口外的历史 tool 结果一律激进压缩：保留 ok/say/message 等短字段 +
+    #     候选摘要（名字+库存+库位，最多 tool_result_candidate_limit=5 条），
+    #     套 tool_result_max_chars（默认 600）上限；
+    #   - stock_in/stock_out 等写操作的 say/message 逐字保留（无论新旧）；
+    #   - 只截内容、不删消息，OpenAI 工具协议（tool_calls/tool_call_id）不受影响。
+    # ------------------------------------------------------------------
+    # 写操作工具：返回里的自然语言结论必须逐字保留（避免误播报）
+    _WRITE_TOOL_NAMES = ("stock_in", "stock_out")
+    # 压缩时逐字保留的话术字段
+    _TOOL_SAY_KEYS = ("say", "message", "msg", "text")
+    # 候选摘要里优先保留的字段（名字+库存+库位）
+    _TOOL_CANDIDATE_KEYS = (
+        "name", "partName", "partNo", "partType", "sku", "variant",
+        "stock", "stockQty", "quantity", "location",
+    )
+
+    def _strip_giant_arrays_for_context(self, value, cand_limit):
+        """保真窗口内超长结果专用：递归把超长数组替换为占位串，其余原样保留。"""
+        if isinstance(value, list):
+            if len(value) > cand_limit:
+                return f"[已省略巨型数组，共 {len(value)} 条]"
+            return [self._strip_giant_arrays_for_context(v, cand_limit) for v in value]
+        if isinstance(value, dict):
+            return {
+                k: self._strip_giant_arrays_for_context(v, cand_limit)
+                for k, v in value.items()
+            }
+        return value
+
+    def _cap_latest_tool_result_for_context(self, text, tool_name=None):
+        """保真窗口内写入时的宽松上限（默认 4000 字）：
+
+        未超限 → 逐字保留原文；超限 → 只剥离与回答无关的巨型数组
+        （data/candidates 等），say/message 全文保留。防单轮多个巨型
+        结果直接撞爆 EdgeLLM 8192 上限。
+        """
+        if not isinstance(text, str) or not text:
+            return text
+        max_chars = int(self.config.get("tool_result_latest_max_chars", 4000))
+        if len(text) <= max_chars:
+            return text
+        cand_limit = int(self.config.get("tool_result_candidate_limit", 5))
+        candidate = text
+        extracted = extract_json_from_string(text)
+        if isinstance(extracted, str) and len(extracted) <= len(text):
+            candidate = extracted
+        try:
+            parsed = json.loads(candidate)
+        except (ValueError, TypeError):
+            # 非 JSON 自然语言结论超长：直接截断（极少见）
+            return text[:max_chars] + f"…[已截断，原 {len(text)} 字]"
+        slim = self._strip_giant_arrays_for_context(parsed, cand_limit)
+        out = json.dumps(slim, ensure_ascii=False)
+        if len(out) > max_chars:
+            out = out[:max_chars] + f"…[已截断，原 {len(out)} 字]"
+        return out
+
+    def _summarize_candidates_for_context(self, value, cand_limit):
+        """窗口外历史工具结果专用：数组/对象 → 紧凑摘要（名字+库存+库位，前 N 条 + 总数）。"""
+        if isinstance(value, list):
+            items = []
+            for it in value[:cand_limit]:
+                if isinstance(it, dict):
+                    keep = {k: it[k] for k in self._TOOL_CANDIDATE_KEYS if k in it}
+                    extra = it.get("extra")
+                    if isinstance(extra, dict):
+                        for k in ("stock", "location", "variant", "sku"):
+                            if k in extra and k not in keep:
+                                keep[k] = extra[k]
+                    if not keep:
+                        keep = {k: it[k] for k in list(it)[:3]}
+                    items.append(keep)
+                else:
+                    items.append(it)
+            return {"total": len(value), "top": items}
+        if isinstance(value, dict):
+            return {
+                k: (
+                    self._summarize_candidates_for_context(v, cand_limit)
+                    if isinstance(v, (list, dict))
+                    else v
+                )
+                for k, v in value.items()
+            }
+        return value
+
+    def _compress_tool_result_for_context(self, text, tool_name=None):
+        """窗口外历史工具结果的激进压缩（治 EdgeLLM 8192 上限被工具大 JSON 撑爆）。
+
+        只留 ok/say/message 等短字段 + 候选摘要（名字+库存+库位，最多
+        tool_result_candidate_limit 条），整体套 tool_result_max_chars 上限；
+        写操作（stock_in/stock_out）的 say/message 逐字保留；
+        非 JSON 文本（自然语言结论）原文保留。
+        """
+        if not isinstance(text, str) or not text:
+            return text
+        is_write = tool_name in self._WRITE_TOOL_NAMES
+        max_chars = int(self.config.get("tool_result_max_chars", 600))
+        cand_limit = int(self.config.get("tool_result_candidate_limit", 5))
+
+        candidate = text
+        extracted = extract_json_from_string(text)
+        if isinstance(extracted, str) and len(extracted) <= len(text):
+            candidate = extracted
+        try:
+            parsed = json.loads(candidate)
+        except (ValueError, TypeError):
+            # 非 JSON：自然语言结论，原文保留
+            return text
+
+        if isinstance(parsed, dict):
+            slim = {}
+            for k, v in parsed.items():
+                if isinstance(v, str):
+                    if (is_write and k in self._TOOL_SAY_KEYS) or len(v) <= 200:
+                        slim[k] = v
+                    else:
+                        slim[k] = v[:200] + f"…[已截断，原 {len(v)} 字]"
+                elif isinstance(v, (dict, list)):
+                    slim[k] = self._summarize_candidates_for_context(v, cand_limit)
+                else:
+                    slim[k] = v
+            out = json.dumps(slim, ensure_ascii=False)
+        else:
+            out = json.dumps(
+                self._summarize_candidates_for_context(parsed, cand_limit),
+                ensure_ascii=False,
+            )
+        if len(out) > max_chars and not is_write:
+            # 写操作不套总上限：say 必须逐字保留（无论新旧）
+            out = out[:max_chars] + f"…[已截断，原 {len(out)} 字]"
+        return out
+
+    def _compress_tool_results_outside_raw_window(self):
+        """每轮新对话（chat depth==0）开始时调用：把超出保真窗口的历史 tool
+        消息就地压缩。窗口 = 最近 tool_result_raw_turns 轮（默认 2 轮），
+        以 dialogue 中倒数第 N 个 user 消息为界，确定性划分，不用时间戳猜。
+        已压缩过的消息带标记，不会重复压缩。
+        """
+        try:
+            try:
+                raw_turns = int(self.config.get("tool_result_raw_turns", 2))
+            except (TypeError, ValueError):
+                raw_turns = 2
+            msgs = getattr(self.dialogue, "dialogue", [])
+            if raw_turns <= 0:
+                boundary = len(msgs)
+            else:
+                user_idx = [
+                    i for i, m in enumerate(msgs) if getattr(m, "role", None) == "user"
+                ]
+                boundary = user_idx[-raw_turns] if len(user_idx) >= raw_turns else 0
+            for i, m in enumerate(msgs):
+                if i >= boundary:
+                    break
+                if (
+                    getattr(m, "role", None) == "tool"
+                    and not getattr(m, "_tool_ctx_compressed", False)
+                ):
+                    m.content = self._compress_tool_result_for_context(
+                        m.content, tool_name=getattr(m, "_tool_name", None)
+                    )
+                    m._tool_ctx_compressed = True
+        except Exception as e:
+            self.logger.bind(tag=TAG).warning(f"历史工具结果压缩失败: {e}")
 
     def _build_tool_fallback_response(self) -> str:
         """工具跑完没有结论时的播报文本。
@@ -1542,19 +2122,22 @@ class ConnectionHandler:
             self.dialogue.put(Message(role="assistant", tool_calls=all_tool_calls))
 
             # 写入每条工具的执行结果，记录"工具返回了什么"
+            # A1：窗口内逐字保留（仅超长时剥离巨型数组），并打标供窗口压缩识别
             for result, tool_call_data in record_tools:
-                text = result.result or ""
-                self.dialogue.put(
-                    Message(
-                        role="tool",
-                        tool_call_id=(
-                            str(uuid.uuid4())
-                            if tool_call_data["id"] is None
-                            else tool_call_data["id"]
-                        ),
-                        content=text,
-                    )
+                tool_msg = Message(
+                    role="tool",
+                    tool_call_id=(
+                        str(uuid.uuid4())
+                        if tool_call_data["id"] is None
+                        else tool_call_data["id"]
+                    ),
+                    content=self._cap_latest_tool_result_for_context(
+                        result.result or "", tool_call_data.get("name")
+                    ),
                 )
+                tool_msg._tool_name = tool_call_data.get("name")
+                tool_msg._tool_ctx_compressed = False
+                self.dialogue.put(tool_msg)
 
             # 用固定文本作为最终回复，补全标准三段式，保证下一条消息是 user 而非接 tool
             response_parts = []
@@ -1587,17 +2170,21 @@ class ConnectionHandler:
             for result, tool_call_data in need_llm_tools:
                 text = result.result
                 if text is not None and len(text) > 0:
-                    self.dialogue.put(
-                        Message(
-                            role="tool",
-                            tool_call_id=(
-                                str(uuid.uuid4())
-                                if tool_call_data["id"] is None
-                                else tool_call_data["id"]
-                            ),
-                            content=text,
-                        )
+                    # A1：窗口内逐字保留（仅超长时剥离巨型数组），并打标供窗口压缩识别
+                    tool_msg = Message(
+                        role="tool",
+                        tool_call_id=(
+                            str(uuid.uuid4())
+                            if tool_call_data["id"] is None
+                            else tool_call_data["id"]
+                        ),
+                        content=self._cap_latest_tool_result_for_context(
+                            text, tool_call_data.get("name")
+                        ),
                     )
+                    tool_msg._tool_name = tool_call_data.get("name")
+                    tool_msg._tool_ctx_compressed = False
+                    self.dialogue.put(tool_msg)
 
             self.chat(None, depth=depth + 1, current_sentence_id=current_sentence_id)
 
@@ -1660,6 +2247,12 @@ class ConnectionHandler:
             # 清理音频缓冲区
             if hasattr(self, "audio_buffer"):
                 self.audio_buffer.clear()
+
+            # 取消待发的前缀预热
+            task = getattr(self, "_llm_prefix_warmup_task", None)
+            if task is not None and not task.done():
+                task.cancel()
+                self._llm_prefix_warmup_task = None
 
             # 取消超时任务
             if self.timeout_task and not self.timeout_task.done():

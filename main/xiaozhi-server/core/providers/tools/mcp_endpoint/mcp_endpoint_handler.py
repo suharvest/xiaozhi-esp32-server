@@ -10,6 +10,57 @@ from .mcp_endpoint_client import MCPEndpointClient
 TAG = __name__
 logger = setup_logging()
 
+# 单个 MCP 工具调用的默认超时（秒）。设备端约 10s 收不到音频就主动断线，
+# 所以工具这一轮必须在 10s 内出结果；留 2s 给 LLM 二次组织话术 + TTS 首包。
+# 可用配置键 mcp_tool_call_timeout_sec 覆盖。
+DEFAULT_MCP_TOOL_CALL_TIMEOUT = 8
+# 超时时回给 LLM 的结构化结果，字段与备品 WMS Provider 的返回体一致，
+# 让 LLM 按提示词第 9 条直接照搬 say 播报，而不是把空异常吞成"网络问题"。
+#
+# 超时只删掉本地 Future（mcp_endpoint_client.cleanup_call_result），远端可能
+# 已经执行完了。所以「超时」不等于「没执行」：
+#   - 只读工具：重试无副作用，executed=False 是安全的说法；
+#   - 写工具：executed 必须是 "unknown"，否则 LLM 会告诉用户"没执行"，
+#     用户再说一次就可能重复入库/出库。
+MCP_TOOL_TIMEOUT_RESULT = {
+    "ok": False,
+    "executed": False,
+    "say": "查询超时，请稍后再试",
+    "say_kind": "tell",
+    "error": "tool_timeout",
+}
+MCP_TOOL_TIMEOUT_RESULT_WRITE = {
+    "ok": False,
+    "executed": "unknown",
+    "say": "操作超时，执行结果未知，请先到系统里核对库存，再决定是否重试",
+    "say_kind": "tell",
+    "error": "tool_timeout",
+    "notice": "执行状态未知",
+}
+# 写操作名（命中即按"执行状态未知"处理）
+MCP_WRITE_TOOL_PATTERN = re.compile(
+    r"stock_in|stock_out|move_|transfer|adjust|delete|update|create", re.IGNORECASE
+)
+# 只读操作名（命中才按"未执行"处理；两个都不命中时保守按写操作）
+MCP_READ_TOOL_PATTERN = re.compile(r"query_|search|resolve_|get_", re.IGNORECASE)
+
+
+def is_write_tool(tool_name: str) -> bool:
+    """工具名是否应按写操作对待。判断不了时返回 True（保守）。"""
+    name = tool_name or ""
+    if MCP_WRITE_TOOL_PATTERN.search(name):
+        return True
+    if MCP_READ_TOOL_PATTERN.search(name):
+        return False
+    return True
+
+
+def timeout_result_for(tool_name: str):
+    """按工具名挑超时结果体。返回 (结果 dict, 日志用的类别名)。"""
+    if is_write_tool(tool_name):
+        return MCP_TOOL_TIMEOUT_RESULT_WRITE, "写操作/无法判断"
+    return MCP_TOOL_TIMEOUT_RESULT, "只读操作"
+
 
 async def connect_mcp_endpoint(mcp_endpoint_url: str, conn=None) -> MCPEndpointClient:
     """连接到MCP接入点"""
@@ -284,10 +335,17 @@ async def send_mcp_endpoint_tools_list_continue(
 
 
 async def call_mcp_endpoint_tool(
-    mcp_client: MCPEndpointClient, tool_name: str, args: str = "{}", timeout: int = 30
+    mcp_client: MCPEndpointClient,
+    tool_name: str,
+    args: str = "{}",
+    timeout: int = DEFAULT_MCP_TOOL_CALL_TIMEOUT,
 ):
     """
     调用指定的MCP接入点工具，并等待响应
+
+    超时不再抛 TimeoutError（上层只会把它记成一条错误信息为空的 ERROR，
+    再回一句"网络遇到点问题"），而是返回结构化的工具结果字符串，让 LLM
+    照搬其中的 say 播报。
     """
     if not await mcp_client.is_ready():
         raise RuntimeError("MCP接入点客户端尚未准备就绪")
@@ -386,7 +444,12 @@ async def call_mcp_endpoint_tool(
         return str(raw_result)
     except asyncio.TimeoutError:
         await mcp_client.cleanup_call_result(tool_call_id)
-        raise TimeoutError("工具调用请求超时")
+        result, kind = timeout_result_for(actual_name)
+        logger.bind(tag=TAG).warning(
+            f"MCP接入点工具调用 {actual_name} 超时（{timeout}秒），按{kind}处理，"
+            f"executed={result['executed']}，返回可播报的超时结果"
+        )
+        return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         await mcp_client.cleanup_call_result(tool_call_id)
         raise e

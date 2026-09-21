@@ -45,6 +45,445 @@ Grouped by theme. Each row: what we changed + why + how to verify after merge.
 | `config.yaml` | Added `OpenVoiceStream` ASR/TTS provider blocks, `EdgeLLM` LLM block; default `selected_module` may reference them | `grep -E "OpenVoiceStream\|EdgeLLM" config.yaml` present; provider blocks intact |
 | `core/providers/asr/sherpa_onnx_local.py` | Moved `modelscope` import inside the function (lazy) for macOS compat | import is inside the method, not module top |
 
+### B1b. ASR fallback reply (2026-09-14)
+
+**What**: `core/providers/asr/base.py` + `core/providers/asr/openvoicestream.py`
++ `config.yaml`. When ASR produces no text (backend unreachable / exception /
+final-timeout with no partial / empty recognition), the server now speaks a
+fallback phrase via TTS (FIRST+LAST single sentence, copied from
+`intentHandler.speak_txt`) so the device finishes playback and returns to
+standby instead of being stuck in "listening" until power-cycle.
+
+**Why**: on the CM5 field box, an unreachable OVS backend made the server send
+nothing at all — `handle_voice_stop()` only replied `if text_len > 0`, the
+`else` branch was empty.
+
+**How**: providers set `self.asr_failed_reason` (`backend_unreachable` /
+`timeout` / `backend_error`); base picks `asr_failure_reply` (default
+"识别服务暂时不可用，请稍后再试") when a reason is set, else
+`asr_empty_reply` (default "没听清，请再说一遍"). Guarded by
+`asr_fallback_enabled` (default true), `conn.client_abort`,
+`conn.stop_event`; whole branch wrapped in try/except (warning only).
+Explicit empty string for a reply key disables that branch.
+
+**Rollback**: redeploy image tag `arm64-fix20260806` (edit compose `image:`
+line back + `docker compose up -d xiaozhi-server`), or set
+`asr_fallback_enabled: false` in `data/.config.yaml`.
+
+**Verify after merge**: `grep -n "_maybe_speak_asr_fallback"
+core/providers/asr/base.py` present; `grep -n "asr_failed_reason"
+core/providers/asr/openvoicestream.py` ≥ 6 hits; `grep -n "asr_fallback_enabled" config.yaml` present.
+
+### B1d. 工具结果上下文压缩（保真窗口 2 轮 / 历史压缩 / 上报不受影响）+ 上下文超限裁剪重试 + LLM 异常 FIRST+LAST 播报 (2026-09-16)
+
+**What**: `core/connection.py` + `core/providers/asr/base.py` + `config.yaml`。
+EdgeLLM 上下文上限 8192（可用输入 ~7064 token）不可上调，历史轮次里
+`query_stock`/`search` 等工具返回的大 JSON 把上下文撑爆，此后该会话每句
+都 400（`input_too_long`），用户感受「老是不回」；且 LLM 异常分支原来用
+单句 MIDDLE 播报，设备通常不播、也不回待命（静默）。
+
+**A1 工具结果压缩**（只作用于「喂给 LLM 的 `role="tool"` 消息内容」，
+挂点仅限 `_handle_function_result()` 的 RECORD / REQLLM 两个写 tool 消息
+分支；`enqueue_tool_report()` 仍收到**原始**工具结果，控制台历史/记忆
+不受影响）：
+- **保真窗口 = 最近 `tool_result_raw_turns` 轮**（默认 **2**，user→assistant
+  为一轮）：窗口内 tool 内容**逐字保留**；单条超宽松上限
+  `tool_result_latest_max_chars`（默认 **4000**）时只剥离与回答无关的
+  巨型数组（`data`/`candidates`），`say` 全文保留；
+- **窗口外的历史 tool 结果一律激进压缩**：保留 `ok`/`say`/`message` 等
+  短字段 + 候选摘要（名字+库存+库位，最多
+  `tool_result_candidate_limit`=**5** 条），套
+  `tool_result_max_chars`（默认 **600**，仅作用于窗口外历史）；
+- `stock_in`/`stock_out` 等写操作的 `say`/`message` **逐字保留（无论新旧）**；
+- 划分方式（确定性，不用时间戳猜）：每次新一轮（`chat()` depth==0）开始
+  时，以 dialogue 中**倒数第 N 个 user 消息**为界，把界前的 tool 消息就地
+  压缩一次（带 `_tool_ctx_compressed` 标记，不重复压缩）。选「新轮开始时
+  就地压缩」而非「拼装请求时压缩」，是因为检索路径（`get_llm_dialogue*`）
+  有多个调用方，就地压缩只做一次、对所有调用方生效且不碰 dialogue.py；
+- 只截内容、不删消息，OpenAI 工具协议（tool_calls/tool_call_id）完整。
+
+**A2 上下文超限裁剪重试**：LLM 调用/流式消费遇 `input_too_long` →
+可 grep WARNING「上下文超限」（含 got_tokens/max 数字）→ 确定性裁剪
+（只留 system + 最近 2 轮 user + 最近一次工具交互，重对齐 tool_calls/tool
+配对，不依赖 tokenizer）→ **最多重试一次**；仍失败 → 清空会话上下文
+（保留 system 与 few-shot）+ FIRST+LAST 播 `llm_context_overflow_reply`
+（默认「信息太多，我先清一下，请再说一遍」）。
+
+**A3 LLM 异常分支改 FIRST+LAST**：非超限 LLM 异常用
+`_speak_llm_fallback()`（写法同 `asr/base.py::_speak_fallback_phrase`，
+已验证单句 MIDDLE 设备不播），话术取 `llm_error_reply`（默认沿用
+`get_system_error_response()`）；守卫 `client_abort`/`stop_event`，
+整个分支 try/except 只打 warning。
+
+**A4 兜底去重**：`asr/base.py::_speak_fallback_phrase` 记录
+`conn._last_fallback_ts`，8 秒内不重复播（避免 listen 超时兜底与 ASR 空
+结果兜底连播两句）。
+
+**Config**（默认值，无需现场改动）：`tool_result_raw_turns: 2`、
+`tool_result_latest_max_chars: 4000`、`tool_result_max_chars: 600`、
+`tool_result_candidate_limit: 5`、`llm_context_overflow_reply`
+（`llm_error_reply` 注释掉，默认沿用 system_error_response）。
+
+**Tests**: `main/xiaozhi-server/test/test_context_overflow.py`（pytest 或容器内
+stdin 运行）：(a) 窗口外历史压缩到上限内且含候选摘要；(b) 窗口内逐字保留、
+超限只剥巨型数组；(c) `enqueue_tool_report` 收到原始串；(d)(e)
+input_too_long 裁剪重试/清空兜底；(f) 裁剪协议完整性；(g) 兜底 8 秒去重。
+
+**Rollback**: 镜像回退 `arm64-allpatch-20260914c`（compose image 行 +
+`up -d --no-deps xiaozhi-server`）。
+
+**Verify after merge**: `grep -n "_compress_tool_results_outside_raw_window\|_cap_latest_tool_result_for_context\|_run_llm_stream_with_overflow_retry\|_speak_llm_fallback" core/connection.py` ≥ 6 hits；
+`grep -n "tool_result_raw_turns" config.yaml` present；
+`grep -n "_last_fallback_ts" core/providers/asr/base.py` present。
+
+### B1c. Listen-timeout fallback（listen 超时兑底）(2026-09-16)
+
+**What**: `core/providers/asr/base.py` +
+`core/handle/textHandler/listenMessageHandler.py` + `config.yaml`. After a
+`listen start`, if for N seconds (default 15) the server gets **no ASR text
+and no voice_stop** (device WiFi jitter / firmware hang → audio never uploaded,
+so `handle_voice_stop()` is never reached), the server now proactively speaks
+a fallback phrase (FIRST+LAST, reusing the B1b speech path, now extracted into
+`_speak_fallback_phrase()` — B1b behavior/logic unchanged) and resets this
+round's audio state, so the device finishes playback and returns to standby
+instead of hanging with a red LED.
+
+**Hook points**: `ListenTextMessageHandler.handle()` state=="start" →
+`conn.asr._start_listen_timeout(conn)` (asyncio task, ref kept on
+`conn._listen_timeout_task`, cancellable); state=="stop" →
+`_cancel_listen_timeout`; `ASRProviderBase.handle_voice_stop()` entry →
+`_cancel_listen_timeout` (covers ASR text for both stream & non-stream
+providers since both funnel through it). New listen start cancels the old
+timer; `client_abort` / `stop_event` are guarded inside the waiter.
+
+**Config** (defaults, no field change required): `asr_listen_timeout_enabled`
+(true), `asr_listen_timeout_sec` (15), `asr_listen_timeout_reply` (defaults to
+`asr_empty_reply`, i.e. "没听清，请再说一遍"; explicit empty string = silent).
+Feature off → behavior identical to pre-patch.
+
+**Log**: WARNING containing the fixed grep marker `listen 超时兜底` plus
+session_id, waited seconds, audio-frame count received so far.
+
+**Tests**: `main/xiaozhi-server/test/test_listen_timeout.py`（pytest 或容器内
+stdin 运行）：(a) 零音频零文本到点播兜底话术（FIRST+LAST）+ 「listen 超时兜底」
+WARNING + 本轮状态复位；(b) 窗口内到达 voice_stop/ASR 文本 → 定时器取消、不播；
+(c) `client_abort=True` → 不播。
+
+**Rollback**: `git checkout -- main/xiaozhi-server/core/providers/asr/base.py
+main/xiaozhi-server/core/handle/textHandler/listenMessageHandler.py` (and
+revert the config.yaml block), or runtime-disable by writing
+`asr_listen_timeout_enabled: false` into `data/.config.yaml` and restarting.
+
+**Verify after merge**: `grep -n "_start_listen_timeout\|_cancel_listen_timeout\|_listen_timeout_waiter" core/providers/asr/base.py` ≥ 6 hits; `grep -n "_start_listen_timeout" core/handle/textHandler/listenMessageHandler.py` = 1 hit; `grep -n "listen 超时兜底" core/providers/asr/base.py` present; `grep -n "asr_listen_timeout" config.yaml` = 3 keys.
+
+### B1e. OVS TTS 会话槽节流（2026-09-16）
+
+**What**: `core/providers/tts/openvoicestream_tts.py` + `config.yaml`。首句之后
+按最小字数合并 TTS 分段、断开/换轮即中止在途 HTTP 流、429 重试收敛到有界等待。
+
+**Why**: 现场 OVS 会话池是**全局计数器 2**（ASR 后端 1 + TTS 后端 1 相加，
+`session_limiter.py` 不分模态）。每轮问答的 LLM 回答被切成 3~5 条 TTS HTTP
+流，每条各抢一次槽；多设备并发或设备重连时 429（`too_many_sessions`）→
+ASR 拿不到槽 → 走 B1b 兜底播「识别服务暂时不可用」→ 设备回待命，用户感受
+「问一句不理人」。
+
+**How**:
+- **(A) 分段合并**：`_get_segment_text()` 覆盖 base 实现。首句沿用 base 规则
+  （`first_sentence_max_chars`，首音频延迟不变）；之后攒够
+  `subsequent_sentence_min_chars`（默认 **32**）字或收到 LAST 才发一条流，
+  余文由 `_process_remaining_text_stream` 排空，不会丢字。
+  配套：`client_abort` / sentence_id 换轮丢弃文本时一并清
+  `processed_chars`/`tts_text_buff`；`SentenceType.FIRST` 分支补
+  `is_first_sentence = True`（与 `tts/base.py:408` 对齐），否则子类会把整轮
+  都当后续句缓冲、首音频被拖慢。
+- **(B) 在途流可中止**：`text_to_speak` 的音频读取从 `async for
+  resp.content.iter_any()` 改成 `wait_for(resp.content.readany(), 0.25)` 轮询，
+  每次轮询前用 `_make_stop_checker(sid)` 检查 `_closed` / `conn.client_abort` /
+  `conn.stop_event` / sentence_id 是否换轮；命中即 break，**不 flush 尾音、不
+  推 LAST**，直接退出 `async with resp` 关连接，OVS 侧随即释放槽。
+  `close()` 先置 `self._closed = True`，在途流在下一个 0.25s 轮询点自行退出。
+- **(C) 429 重试收敛**：`_post_with_retry(..., stopped=)` 用
+  `max_retries`（**2**）、单次退避与 `Retry-After` 都夹到 `retry_max_delay`
+  （**1.5s**）、整个重试阶段共享 `retry_budget_seconds`（**3.0s**）deadline；
+  退避改成 0.1s 分片睡，睡的过程中命中 `stopped()` 立即放弃。超预算即放弃
+  这一句交回上层兜底，而不是把整轮堵死。
+- **顺带修**：`_process_remaining_text_stream` 里 `processed_chars += len(full_text)`
+  应为 `=`（它是「已消费字符数」不是增量），原写法多次调用后越界，后续文本
+  被整段跳过。
+
+**Config**（`TTS.OpenVoiceStream` 块，默认值即现场值）：
+`subsequent_sentence_min_chars: 32`、`max_retries: 2`、`retry_max_delay: 1.5`、
+`retry_budget_seconds: 3.0`。
+
+**Tests**: `main/xiaozhi-server/test/test_tts_slot_saving.py`（a–g，pytest 或
+容器内 stdin 运行）：(a) 首句仍按 base 规则出；(b) 后续句不足 32 字不发流；(c) 攒够即发；
+(d) LAST 排空余文且 `processed_chars` 不越界；(e) 换轮/abort 清缓冲；
+(f) `stopped()` 命中时中途退出且不推 LAST；(g) 重试预算耗尽返回 None。
+
+**Deployed**: 现场镜像 `arm64-fix-20260916e`（瘦镜像）/ registry
+`arm64-20260916`。切换后 10 分钟真实流量：`ovs_sessions_rejected_total` **0**，
+每轮 TTS 流条数从 **3~5 降到 2**。
+
+**Rollback**: 镜像回退 `arm64-fix-20260916d`（compose `image:` 行 +
+`docker compose up -d xiaozhi-server`）。
+
+**Verify after merge**: `grep -n "_make_stop_checker\|subsequent_sentence_min_chars\|retry_budget_seconds" core/providers/tts/openvoicestream_tts.py` ≥ 3 hits。
+
+### B1f. OVS TTS 补非流式 `to_tts()`（唤醒词回应缓存，2026-09-17）
+
+**What**: `core/providers/tts/openvoicestream_tts.py`。新增 `to_tts()` 与
+`handle_opus()` 覆写，把一次合成的 opus 帧采集成列表返回，不经播放队列。
+
+**Why**: `core/handle/helloHandle.py:147` 的 `wakeupWordsResponse` 每次唤醒且
+缓存超过 10s 就 `await asyncio.to_thread(conn.tts.to_tts, text)`。
+`core/providers/tts/base.py:218` 的 `to_tts` 调 `text_to_speak(text, None)` 并
+期望拿到音频字节，而本 provider 的 `text_to_speak` 是流式的（返回 bool，音频经
+`handle_opus` 推进 `tts_audio_queue`）→ base 抛
+`a bytes-like object is required, not 'bool'` 并重试 5 次；每次重试都真的向
+OVS 发一条 TTS 流（抢 5 次会话槽）并把帧塞进播放队列。
+
+**How**:
+- `__init__` 新增 `self._collect_frames = None` 与 `self._synth_lock`。
+- `to_tts(text)`：持锁置 `_collect_frames`，`asyncio.run(text_to_speak(...))`，
+  finally 复位；成功且帧非空返回 opus 帧 bytes 列表（与 base `to_tts` 契约一致，
+  调用方用 `opus_datas_to_wav_bytes(frames, sample_rate=conn.sample_rate)` 解码），
+  否则返回 None 且不抛。
+- `handle_opus`：采集模式下把帧 append 进列表并返回，否则走 `super()`。
+- `text_to_speak`：采集模式下不往 `tts_audio_queue` put FIRST/LAST；
+  `_make_stop_checker(sid, ignore_round=True)` 跳过 sentence_id 换轮判定
+  （采集与对话轮次无关），仍尊重 `_closed` / `stop_event` / `client_abort`。
+- `to_tts_single_stream` 的 `asyncio.run(...)` 同样持 `_synth_lock`，避免采集期间
+  另一条流的帧混进列表。
+
+**Tests**: `main/xiaozhi-server/test/test_tts_slot_saving.py` 新增 (h)(i)：
+(h) `to_tts` 返回非空帧列表且 `tts_audio_queue` 为空；
+(i) `current_sentence_id != conn.sentence_id` 时采集仍正常完成。
+
+**Verify after merge**: `grep -n "_collect_frames\|def to_tts" core/providers/tts/openvoicestream_tts.py` ≥ 3 hits。
+
+### B1g. 唤醒后首段与极短音频的空识别不播兜底（2026-09-17）
+
+**What**: `core/providers/asr/base.py` + `config.yaml`（新键
+`asr_empty_min_frames`，默认 8）。
+
+**Why**: B1b 的空结果兜底对两类非提问音频误触发：唤醒回应播放期间设备上传的
+那段音频（`just_woken_up`）、以及误触产生的半秒不到的音频。两者识别为空是正常
+的，补播「没听清」变成自问自答。
+
+**How**: `handle_voice_stop` 的 `text_len == 0` 分支把 `len(asr_audio_task)` 作为
+`audio_frames` 传给 `_maybe_speak_asr_fallback`（保留默认值 `None`，对既有调用
+兼容）。新增 `_skip_empty_fallback()`，**仅在 `reason` 为空**（即真·空识别，
+非后端故障）时生效：`conn.just_woken_up` 为 True → 跳过；
+`audio_frames < asr_empty_min_frames`（帧长 60ms，8 帧≈0.5s）→ 跳过。
+两种跳过各打一条 INFO。`reason` 非空仍播 `asr_failure_reply`。
+
+**Config**: `asr_empty_min_frames: 8`（设 0 关闭该豁免）。
+
+**Tests**: `main/xiaozhi-server/test/test_asr_empty_guard.py`（a–d）：
+(a) `just_woken_up=True` + 空文本不入队；(b) 3 帧 + 空文本不入队；
+(c) 20 帧 + 空文本入队「没听清」；(d) `reason="timeout"` 即使 3 帧仍播
+「识别服务暂时不可用」。
+
+**Verify after merge**: `grep -n "_skip_empty_fallback\|asr_empty_min_frames" core/providers/asr/base.py config.yaml` ≥ 3 hits。
+
+### B1h. 每次 LLM 调用记录前缀指纹与 TTFT（2026-09-18）
+
+**What**: 新增 `core/providers/llm/telemetry.py`（A 类新文件），
+`core/providers/llm/openai/openai.py` 两个流式方法各加一层包装，
+`core/connection.py` 增加 `_note_llm_prefix()`。
+
+**Why**: 现场 EdgeLLM（J4012, TRT-LLM, OpenAI 兼容）只为「开头 system 块
+（静态 system prompt + tools）」保留 KV 检查点。实测前缀命中时 TTFT 1.3~2.3s，
+前缀失配要整段重新 prefill，**9~13s**，而设备约 10s 收不到音频就断线——2026-09-18
+早上 4 次断线全是冷前缀。要修它，先得有「这轮前缀是什么、为什么变」的证据。
+
+**How**:
+- `compute_prefix_md5(dialogue, functions)` = md5(messages[0] 的 system 内容 +
+  `json.dumps(functions, sort_keys=True)`)[:8]。只取第一条 system（对应
+  `get_llm_dialogue_with_memory()` 的静态段），动态 system（时间/记忆/说话人）
+  本来就每轮变，不进指纹。
+- `instrument_stream()` 透明包住 provider 的生成器：首个**非空** delta
+  （content 或 tool_calls）记 `ttft`，流结束记 `total`，打一条 INFO
+  `LLM call: prefix=<md5> tools=<n> msgs=<n> chars=<n> ttft=<x.xx>s total=<y.yy>s`；
+  异常路径打 `LLM call failed: ... err=<类型>: <消息>`；调用方提前 break 不打。
+- `openai.py` 的 `response()` / `response_with_functions()` 改为返回包装后的
+  生成器，原实现移到 `_response_stream()` / `_response_with_functions_stream()`。
+- `connection.py` 在 `chat()` 组好 `messages_for_llm` 之后调 `_note_llm_prefix()`，
+  指纹变化时打 `LLM prefix changed: <old>-><new> (tools <n_old>-><n_new>)`。
+
+**Tests**: `main/xiaozhi-server/test/test_llm_call_telemetry.py`（a–c）。
+
+**Verify after merge**: `grep -n "instrument_stream" core/providers/llm/openai/openai.py` = 3 hits；
+`grep -n "_note_llm_prefix" core/connection.py` = 2 hits。
+
+### B1i. 连接就绪与工具变化后预热 EdgeLLM 前缀缓存（2026-09-18）
+
+**What**: `core/connection.py`、`core/utils/dialogue.py`（新参数
+`include_history`）、`core/providers/tools/unified_tool_manager.py`、
+`core/providers/llm/base.py`（`response_with_functions` 加 `**kwargs`）+
+`config.yaml`（新键 `llm_prefix_warmup_enabled` / `llm_prefix_warmup_debounce_sec`）。
+
+**Why**: 接 B1h。冷前缀一次 prefill 9~13s，设备约 10s 收不到音频就断线；工具列表
+是分批到达的（设备 MCP 每批一次、MCP 接入点就绪一次），前缀在连接建立后的头几秒
+里会变好几次，第一句真实提问十有八九撞上冷前缀。
+
+**How**:
+- `ConnectionHandler._warm_llm_prefix(reason)`：走与 `chat()` 相同的组装路径拿
+  `functions`（含 `DIRECT_ANSWER_TOOL`）与 messages（静态 system + few-shot +
+  动态 system，`include_history=False`，末尾补一条 `"。"` 让请求不以 system 收尾），
+  以 `max_tokens=1` 发一次流并丢弃输出。不写 dialogue、不进 TTS、不上报；
+  非阻塞锁保证同一连接同时只有一次预热；`_llm_chat_active > 0`（真实对话进行中）
+  直接跳过；任何异常只打 WARNING。日志
+  `LLM prefix warmup (<reason>): prefix=<md5> tools=<n> took=<x.xx>s`。
+- 触发：`_initialize_components()` 注入 few-shot 之后一次（`connection_ready`）；
+  `ToolManager.refresh_tools()` 一次（`tools_changed`）——所有工具来源都从这个方法过。
+  两者都走 `_schedule_llm_prefix_warmup()`，用可取消的 asyncio 任务做去抖，
+  最后一次变化后 `llm_prefix_warmup_debounce_sec`（默认 1.5）秒才真正发出；
+  实际请求在 `asyncio.to_thread` 里跑，不占事件循环。`close()` 取消待发任务。
+- `Dialogue.get_llm_dialogue_with_memory(..., include_history=False)` 只产出前缀
+  三段，不带任何真实用户/助手消息（默认 True，既有调用不变）。
+
+**Config**: `llm_prefix_warmup_enabled: true`、`llm_prefix_warmup_debounce_sec: 1.5`。
+
+**Tests**: `main/xiaozhi-server/test/test_llm_prefix_warmup.py`（a–d）。
+
+**Verify after merge**: `grep -n "_schedule_llm_prefix_warmup" core/connection.py core/providers/tools/unified_tool_manager.py` ≥ 4 hits；
+`grep -n "include_history" core/utils/dialogue.py` = 3 hits。
+
+### B1j. `direct_answer` 在所有深度注入，工具列表跨轮稳定（2026-09-18）
+
+**What**: `core/connection.py`（新增 `_build_llm_functions()`，`chat()` 与
+`_warm_llm_prefix()` 共用）。
+
+**Why**: 接 B1h/B1i。原来只在 `depth == 0` 追加 `DIRECT_ANSWER_TOOL`，工具结果那
+一轮少一个工具，EdgeLLM 的「静态 system + tools」前缀立刻失配。现场日志
+（2026-09-18 11:10）：`tools=29 ttft=0.55s` → `prefix changed (tools 29->28)` →
+`tools=28 ttft=2.37s` → 下一轮又变回 29，每轮都在整段重算 prefill。
+
+**How**: `_build_llm_functions(force_final_answer=False)` 返回
+`func_handler.get_functions() + [DIRECT_ANSWER_TOOL]`（追加在末尾，顺序不变），
+所有深度一致；`force_final_answer`（撞 `MAX_DEPTH`）仍返回 `None` 禁用工具。
+depth>0 注入不会循环：`direct_answer` 的处理是「流式播报 + 写对话历史 + return」，
+不递归回 `chat()`；该分支补上 `_pending_tool_answer = False`，答案短于流式安全
+缓冲区时也不会在 `depth == 0` 收尾被重复补一句兜底。
+
+**Tests**: `test/test_llm_prefix_warmup.py` (e)。
+
+**Verify after merge**: `grep -n "DIRECT_ANSWER_TOOL" core/connection.py` = 2 hits
+（定义 + `_build_llm_functions`）。
+
+### B1k. 前缀变化日志带工具名 diff（2026-09-18）
+
+**What**: `core/connection.py`（`_note_llm_prefix()` + `_llm_function_names()`）。
+
+**Why**: B1h 的 `LLM prefix changed: a->b (tools 29->28)` 只给数量，看不出是哪个
+工具来了或走了；工具来源有三处（内置、设备 MCP、MCP 接入点），数量对不上时靠
+翻别的日志猜。
+
+**How**: 记住上一次的 `function.name` 集合，变化时按集合差打
+`added=[...] removed=[...]`。
+
+**Tests**: `test/test_llm_prefix_warmup.py` (f)。
+
+### B1l. listen 超时在音频仍在到达时顺延（2026-09-18）
+
+**What**: `core/providers/asr/base.py`（`receive_audio()` 记 `conn._last_audio_frame_ts`；
+`_listen_timeout_waiter()` 改为 quiet 窗口轮询）+ `config.yaml`（新键
+`asr_listen_timeout_quiet_sec` 默认 3.0、`asr_listen_timeout_max_sec` 默认 60）。
+
+**Why**: 接 B1c。原实现是硬计时：`asr_listen_timeout_sec` 到点就播兜底。现场日志
+`listen 超时兜底: 已等待=15s, 收到音频帧数=212, 补播兜底话术` —— 用户连续说了
+12.7s，VAD 没判停，服务端插播「没听清」，5s 后 ASR 才把长句吐出来。
+
+**How**: 到点只是「开始怀疑」。若最后一帧距今 < `asr_listen_timeout_quiet_sec`
+就再等一个 quiet 窗口后复查（循环），只有「连续 quiet 秒无音频帧」且仍无 ASR 文本
+/ voice_stop 才真正兜底；总时长上限 `asr_listen_timeout_max_sec`（从 listen start
+起算），到顶仍在收音频也强制兜底并打 WARNING。兜底日志加上帧数与最后一帧距今秒数。
+`quiet <= 0` 退回原来的硬计时行为。所有流式 ASR 子类的 `receive_audio()` 都
+`super()` 到基类，时间戳一处记录即可。
+
+**Tests**: `test/test_listen_timeout.py` (d)(e)。
+
+**Verify after merge**: `grep -n "_last_audio_frame_ts" core/providers/asr/base.py` = 4 hits。
+
+### B1m. `server_plugins_exclude`：可排除硬编码必载的 `get_lunar`（2026-09-18）
+
+**What**: `core/providers/tools/server_plugins/plugin_executor.py`、
+**新增** `config/local_overrides.py`、`config/config_loader.py`（1 行 hook +
+1 行 import）+ `config.yaml`（新键 `server_plugins_exclude`，默认 `[]`）。
+
+**Why**: 上游把 `get_lunar` 写死在 `necessary_functions` 里，智控台上关不掉。
+工具列表每多一个条目就多一段前缀 JSON，而 EdgeLLM 只缓存「静态 system + tools」
+这段 KV（见 B1h/B1j）。
+
+**How**: 合并 `necessary_functions + config_functions` 之后，按
+`config["server_plugins_exclude"]` 过滤函数名；`handle_exit_intent` 是退出意图的
+唯一入口，写在排除列表里会被忽略并打 WARNING。
+
+**注意（与本文件 §C 的出入）**：§C 描述的 `config/local_overrides.py` 与
+`get_config_from_api_async()` 里的 hook 在本分支里**并不存在**（现场容器里也没有），
+本节一并补上。白名单故意不含 `ASR`/`TTS`/`LLM`/`selected_module`：那几段现在由
+manager 管着，放进白名单会让网页上的改动失效。
+
+**白名单内容（2026-09-21 更新）**：除 `server_plugins_exclude` 外，本分支后续
+新增的可调键也必须在里面，否则 console 模式下写在 `data/.config.yaml` 里不生效——
+- `mcp_tool_call_timeout_sec`（B1n）
+- `asr_listen_timeout_quiet_sec` / `asr_listen_timeout_max_sec` / `asr_empty_min_frames`
+- `llm_prefix_warmup_enabled` / `llm_prefix_warmup_debounce_sec`
+
+**Config**: `server_plugins_exclude: []`。console（manager-api）模式下这个键要写在
+`data/.config.yaml`，由 `apply_local_overrides()` 合并回 manager 拉来的配置。
+
+**Tests**: `main/xiaozhi-server/test/test_server_plugins_exclude.py`（a–c；d 覆盖白名单合并）。
+
+**Verify after merge**: `grep -n "apply_local_overrides" config/config_loader.py` = 2 hits。
+
+### B1n. MCP 工具调用超时可配（默认 8s）并返回可播报结果（2026-09-21）
+
+**What**: `core/providers/tools/mcp_endpoint/mcp_endpoint_handler.py`、
+`core/providers/tools/mcp_endpoint/mcp_endpoint_executor.py`、
+`core/connection.py`（`工具调用超时或异常` 分支前加一个 `CancelledError` 分支）
++ `config.yaml`（新键 `mcp_tool_call_timeout_sec`，默认 8）。
+
+**Why**: 上游 `call_mcp_endpoint_tool()` 的超时写死 30s，而设备端约 10s
+收不到音频就主动断线。后端慢或不可达时，工具这一轮要等 30s，设备早断了；
+断开又会 cancel 掉这些 future，`core/connection.py` 把 `CancelledError`
+记成 ERROR，而它的 `str(e)` 恒为空 —— 现场一天 16 条错误信息为空的 ERROR
+就是这么来的，真正的工具失败反而被淹没。
+
+**How**:
+1. `DEFAULT_MCP_TOOL_CALL_TIMEOUT = 8` 作为函数签名默认值，执行器从
+   `conn.config["mcp_tool_call_timeout_sec"]` 取值传入。
+2. 超时不再 `raise TimeoutError`，改为返回一段与备品 WMS Provider 同构的 JSON
+   字符串 —— LLM 按提示词第 9 条照搬其中的 `say` 播报；同时打一条带工具名、
+   秒数与类别的 WARNING。
+   **`executed` 的语义按工具名分两类**（2026-09-21 补）：超时只删掉本地
+   Future（`mcp_endpoint_client.py` 的 `cleanup_call_result`），远端可能已经
+   执行完了，所以"超时"不等于"没执行"。
+   - **写操作**（名字命中 `stock_in|stock_out|move_|transfer|adjust|delete|
+     update|create`，以及两类正则都不命中、判断不了的）→
+     `{"ok": false, "executed": "unknown", "say": "操作超时，执行结果未知，
+     请先到系统里核对库存，再决定是否重试", "say_kind": "tell",
+     "error": "tool_timeout", "notice": "执行状态未知"}`。
+     `executed: "unknown"` 是字符串而非布尔，表示"远端执行状态不可知"：
+     LLM 不得播报"没有执行"，必须让用户先去系统核对再决定是否重试。
+   - **只读操作**（名字命中 `query_|search|resolve_|get_`）→ 保持
+     `executed: false` + "查询超时，请稍后再试"：重试无副作用。
+   分类函数 `is_write_tool()` / `timeout_result_for()` 在
+   `mcp_endpoint_handler.py` 里，默认保守归为写操作。
+3. `core/connection.py` 的 `CancelledError`（设备断开）降为 INFO，
+   回给用户的兜底话术与上报行为不变。
+
+**Config**: `mcp_tool_call_timeout_sec: 8`。console（manager-api）模式下这个键
+读的是 `conn.config`，与 `tool_call_timeout`（上层 future 的总超时，仍是 30）
+是两个值：前者管单个 MCP 工具往返，后者管一轮里所有工具加起来。
+
+**Tests**: `main/xiaozhi-server/test/test_mcp_tool_timeout.py`（a/b/b2/b3/c/c2/d/e）。
+
+**Verify after merge**: `grep -n "DEFAULT_MCP_TOOL_CALL_TIMEOUT"
+core/providers/tools/mcp_endpoint/*.py` = 4 hits；
+`grep -n "CancelledError" core/connection.py` 命中工具调用那一处。
+
 > **SUPERSEDED — VAD ONNX patch (commit `0ad7cf4a`).** We used to carry a
 > `core/providers/vad/silero_onnx_wrapper.py` shim so Silero VAD ran on
 > onnxruntime instead of torch. Upstream has since rewritten

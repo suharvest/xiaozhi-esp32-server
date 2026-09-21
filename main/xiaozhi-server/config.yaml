@@ -63,11 +63,71 @@ close_connection_no_voice_time: 120
 tts_timeout: 10
 # 工具调用超时时间(秒)
 tool_call_timeout: 30
+# 单个 MCP 接入点工具调用的超时时间(秒)。设备端约 10s 收不到音频即断线，
+# 所以这一轮必须在 10s 内出结果，默认 8s 给 LLM 二次组织话术 + TTS 首包留余量。
+# 超时不再抛异常，而是回一条 {"ok":false,"say":"查询超时，请稍后再试"} 让 LLM 照搬播报。
+mcp_tool_call_timeout_sec: 8
 # 工具调用期间播报的填充语，置空则不播。
 # 模型走 function call 那一轮只返回 tool_calls、不带文本，设备在推理+工具往返
 # 期间会连续数秒收不到音频而主动断连（服务端 close_connection_no_voice_time
 # 拦不住）。这句话由服务端补发，不进对话历史。
 tool_call_filler: "正在查询。"
+
+# 工具结果进 LLM 上下文前的压缩（治 EdgeLLM 8192 上限被工具大 JSON 撑爆）。
+# 保真窗口：最近 N 轮（user→assistant 为一轮）内的 tool 结果逐字保留，
+# 窗口外的历史 tool 结果一律压缩（保留 ok/say/message + 候选摘要：
+# 名字+库存+库位）。写操作（stock_in/stock_out）的 say 任何情况下逐字保留。
+# 上报/记忆路径不受影响（enqueue_tool_report 仍收到原始结果）。
+tool_result_raw_turns: 2
+# 窗口内单条 tool 结果的宽松上限（字）：超限时只剥离巨型数组，say 全文保留
+tool_result_latest_max_chars: 4000
+# 仅作用于窗口外历史 tool 结果的长度上限（字）
+tool_result_max_chars: 600
+# 历史候选摘要最多保留条数
+tool_result_candidate_limit: 5
+# LLM 异常（非上下文超限）时的播报话术；不配置则沿用 system_error_response
+# llm_error_reply: "主人，小智现在有点忙，我们稍后再试吧。"
+# 上下文超限（input_too_long）裁剪重试仍失败时，清空会话上下文并播报的话术；
+# 显式空字符串 = 不播
+llm_context_overflow_reply: "信息太多，我先清一下，请再说一遍"
+
+# LLM 前缀缓存预热（治 EdgeLLM 冷前缀）。现场 EdgeLLM 只为「开头 system 块
+# （静态 system prompt + tools）」保留 KV 检查点：前缀热时 TTFT 1.3~2.3s，
+# 前缀冷时要整段重新 prefill，实测 9~13s，而设备约 10s 收不到音频就断线。
+# 开启后，连接就绪与工具列表变化（设备 MCP 分批到达、MCP 接入点就绪、
+# refresh_tools）之后各发一次 max_tokens=1 的空请求把前缀捂热；
+# 预热不写对话历史、不进 TTS、不上报，真实对话进行中自动跳过。
+llm_prefix_warmup_enabled: true
+# 去抖秒数：最后一次工具变化之后等这么久才真正发预热请求
+llm_prefix_warmup_debounce_sec: 1.5
+
+# ASR 无结果时的兑底播报。ASR 后端不可达/异常/超时/识别为空时，服务端补播
+# 一句话让设备播完回到「待命」，而不是卡在「聆听中」只能断电。
+# 设为 false 关闭兑底播报；话术显式设为空字符串则对应分支不播。
+asr_fallback_enabled: true
+# ASR 后端不可达/异常/超时无文本时播报
+asr_failure_reply: "识别服务暂时不可用，请稍后再试"
+# ASR 正常工作但没识别出内容时播报
+asr_empty_reply: "没听清，请再说一遍"
+# 空识别兜底的最小音频帧数（帧长 60ms，8 帧≈0.5s）。不足该帧数的空识别视为
+# 误触而非提问，不播 asr_empty_reply；设为 0 关闭该豁免。
+# 另：刚被唤醒（just_woken_up）时的首段空识别也一律不播——那段音频是唤醒
+# 回应自己的回声。两条豁免都只作用于空结果，后端故障仍播 asr_failure_reply。
+asr_empty_min_frames: 8
+# listen 超时兑底：设备进入聆听态后 N 秒内既无 ASR 文本也无 voice_stop
+#（如 WiFi 抖动/固件卡死导致音频根本没上传，服务端永远不会走到
+# handle_voice_stop），服务端主动补播一句并复位本轮状态，避免设备亮红灯卡死。
+asr_listen_timeout_enabled: true
+# 超时秒数，默认 15 秒，设为 0 或负数等同关闭
+asr_listen_timeout_sec: 15
+# 超时话术；不配置则默认沿用 asr_empty_reply；显式空字符串 = 超时不播报
+# asr_listen_timeout_reply: "没听清，请再说一遍"
+# 到点时若音频仍在到达则顺延：要求"连续 N 秒没有新音频帧"才真正兜底。
+# 现场用户连续说了 12.7s、VAD 未判停，15s 硬计时插播「没听清」，5s 后 ASR 才出长句。
+# 设为 0 或负数 = 关闭顺延，退回硬计时。
+asr_listen_timeout_quiet_sec: 3.0
+# 顺延总时长上限（从 listen start 起算），到顶仍在收音频也强制兜底；0 或负数 = 不限
+asr_listen_timeout_max_sec: 60
 # 开启唤醒词加速
 enable_wakeup_words_response_cache: true
 # 开场是否回复唤醒词
@@ -132,6 +192,15 @@ context_providers:
   - url: ""
     headers:
       Authorization: ""
+
+# 从服务端必载/配置的插件列表里排除指定插件（按函数名）。
+# 上游把 get_lunar 写死在 necessary_functions 里，智控台上关不掉；工具列表每多一个
+# 条目就多一段前缀，EdgeLLM 只缓存 system+tools 这段 KV。
+# handle_exit_intent 是退出意图的唯一入口，写在这里会被忽略并打 WARNING。
+# console（manager-api）模式下这个键要写在 data/.config.yaml，由 config/local_overrides.py
+# 的白名单合并回来。
+server_plugins_exclude: []
+#  - get_lunar
 
 # 插件的基础配置
 plugins:
@@ -1232,4 +1301,13 @@ TTS:
     pitch: null
     language: null
     timeout: 30
+    # OVS 会话池只有 2 个全局槽（ASR 1 + TTS 1），每句话一条 HTTP 流各占 1 个。
+    # 首句之后按最小字数合并分段：一段回答从 4~8 条流降到 1~2 条，争抢次数同比下降。
+    # 首句不受影响（仍走 first_sentence_max_chars 规则），首音频延迟不变。
+    subsequent_sentence_min_chars: 32
+    # 429（too_many_sessions）重试收敛：槽满时最多重试 2 次、单次退避 ≤1.5s、
+    # 整个重试阶段 ≤3.0s。超出即放弃这一句，交回上层兜底，而不是把整轮堵死。
+    max_retries: 2
+    retry_max_delay: 1.5
+    retry_budget_seconds: 3.0
     output_dir: tmp/

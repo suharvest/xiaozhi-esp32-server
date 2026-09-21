@@ -18,6 +18,7 @@ from core.handle.receiveAudioHandle import startToChat
 from core.handle.reportHandle import enqueue_asr_report
 from core.utils.util import remove_punctuation_and_length
 from core.handle.receiveAudioHandle import handleAudioMessage
+from core.providers.tts.dto.dto import ContentType, SentenceType, TTSMessageDTO
 from typing import Optional, Tuple, List, NamedTuple, TYPE_CHECKING
 
 
@@ -30,7 +31,10 @@ logger = setup_logging()
 
 class ASRProviderBase(ABC):
     def __init__(self):
-        pass
+        # ASR 失败原因标记，由具体 provider 置位（如 backend_unreachable /
+        # timeout / backend_error），供 handle_voice_stop 的兜底播报选择话术。
+        # 每轮识别结束后会复位为 None，避免跨轮串味。
+        self.asr_failed_reason = None
 
     # 打开音频通道
     async def open_audio_channels(self, conn: "ConnectionHandler"):
@@ -59,6 +63,9 @@ class ASRProviderBase(ABC):
 
     # 接收音频
     async def receive_audio(self, conn: "ConnectionHandler", pcm_frame, audio_have_voice):
+        # 记录最后一帧音频到达时刻（monotonic），listen 超时兜底靠它判断
+        # 「用户还在说」还是「音频真的断了」。所有流式 ASR 子类都会 super() 到这里。
+        conn._last_audio_frame_ts = time.monotonic()
         if conn.client_listen_mode == "manual":
             # 手动模式：缓存音频用于ASR识别
             conn.asr_audio.append(pcm_frame)
@@ -83,6 +90,8 @@ class ASRProviderBase(ABC):
     # 处理语音停止
     async def handle_voice_stop(self, conn: "ConnectionHandler", asr_audio_task: List[bytes]):
         """并行处理ASR和声纹识别"""
+        # 语音停止/ASR出文本都会走到这里，本轮 listen 超时兜底定时器必须取消
+        self._cancel_listen_timeout(conn)
         try:
             total_start_time = time.monotonic()
 
@@ -168,11 +177,219 @@ class ASRProviderBase(ABC):
                 enqueue_asr_report(conn, enhanced_text, audio_snapshot)
                 # 使用自定义模块进行上报
                 await startToChat(conn, enhanced_text)
+            else:
+                # ASR 没有任何产出（后端不可达/异常/超时/识别为空）。
+                # 不能什么都不发，否则设备会一直停在「聆听中」只能断电。
+                reason = getattr(self, "asr_failed_reason", None)
+                self.asr_failed_reason = None
+                self._maybe_speak_asr_fallback(
+                    conn, reason, audio_frames=len(asr_audio_task)
+                )
         except Exception as e:
             logger.bind(tag=TAG).error(f"处理语音停止失败: {e}")
             import traceback
 
             logger.bind(tag=TAG).debug(f"异常详情: {traceback.format_exc()}")
+
+    def _maybe_speak_asr_fallback(
+        self,
+        conn: "ConnectionHandler",
+        reason: Optional[str],
+        audio_frames: Optional[int] = None,
+    ):
+        """ASR 无结果时补播一句兜底话术，让设备播完并回到「待命」。
+
+        写法照抄 core/handle/intentHandler.py 的 speak_txt()：FIRST+LAST 单独成句。
+        任何异常只打 warning，绝不能让 handle_voice_stop 崩。
+        """
+        try:
+            if not conn.config.get("asr_fallback_enabled", True):
+                return
+            if getattr(conn, "client_abort", False):
+                logger.bind(tag=TAG).info("用户已打断，跳过ASR兜底播报")
+                return
+            if conn.stop_event.is_set():
+                return
+            if not reason and self._skip_empty_fallback(conn, audio_frames):
+                return
+            if reason:
+                phrase = conn.config.get(
+                    "asr_failure_reply", "识别服务暂时不可用，请稍后再试"
+                )
+            else:
+                phrase = conn.config.get("asr_empty_reply", "没听清，请再说一遍")
+            if not phrase:
+                # 显式空字符串 = 该分支不播报
+                return
+            self._speak_fallback_phrase(conn, phrase)
+        except Exception as e:
+            logger.bind(tag=TAG).warning(f"ASR兜底播报失败: {e}")
+
+    def _skip_empty_fallback(
+        self, conn: "ConnectionHandler", audio_frames: Optional[int]
+    ) -> bool:
+        """空识别（reason 为空）是否该跳过兜底。
+
+        只对**空结果**分支生效：reason 非空说明后端故障，那句「识别服务暂时
+        不可用」必须播。两种豁免：
+
+        1. 刚被唤醒——唤醒回应还在播，设备把这段音频当一次 listen 上来，
+           识别为空是正常的，再补一句「没听清」就成了自问自答；
+        2. 音频过短——帧长 60ms，默认 8 帧≈0.5s。误触/半个字根本不构成一次
+           提问，不该被当作识别失败。
+        """
+        if getattr(conn, "just_woken_up", False):
+            logger.bind(tag=TAG).info("唤醒后首段空识别，跳过兜底")
+            return True
+        if audio_frames is None:
+            return False
+        try:
+            min_frames = int(conn.config.get("asr_empty_min_frames", 8))
+        except (TypeError, ValueError):
+            min_frames = 8
+        if min_frames > 0 and audio_frames < min_frames:
+            logger.bind(tag=TAG).info(
+                f"空识别音频仅 {audio_frames} 帧（<{min_frames}），跳过兜底"
+            )
+            return True
+        return False
+
+    def _speak_fallback_phrase(self, conn: "ConnectionHandler", phrase: str):
+        """按 FIRST+LAST 单句播一条兜底话术（供 ASR 空结果兜底与 listen 超时兜底复用）。
+        任何异常只打 warning，绝不能让上层崩。
+        """
+        try:
+            if getattr(conn, "client_abort", False):
+                logger.bind(tag=TAG).info("用户已打断，跳过兜底播报")
+                return
+            if conn.stop_event.is_set():
+                return
+            # A4 兜底去重：8 秒内不重复播（避免 listen 超时兜底与 ASR 空结果
+            # 兜底连播两句）
+            now = time.monotonic()
+            if now - getattr(conn, "_last_fallback_ts", 0.0) < 8:
+                logger.bind(tag=TAG).info("8秒内已播过兜底话术，跳过重复播报")
+                return
+            conn._last_fallback_ts = now
+            logger.bind(tag=TAG).warning(
+                f"补播兜底话术: phrase={phrase!r}"
+            )
+            conn.sentence_id = str(uuid.uuid4().hex)
+            conn.tts.store_tts_text(conn.sentence_id, phrase)
+            conn.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=conn.sentence_id,
+                    sentence_type=SentenceType.FIRST,
+                    content_type=ContentType.ACTION,
+                )
+            )
+            conn.tts.tts_one_sentence(conn, ContentType.TEXT, content_detail=phrase)
+            conn.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=conn.sentence_id,
+                    sentence_type=SentenceType.LAST,
+                    content_type=ContentType.ACTION,
+                )
+            )
+        except Exception as e:
+            logger.bind(tag=TAG).warning(f"兜底播报失败: {e}")
+
+    # ------------------------------------------------------------------
+    # listen 超时兜底：进入聆听态后 N 秒内既无 ASR 文本也无 voice_stop
+    #（如设备 WiFi 抖动/固件卡死导致音频根本没上传），服务端主动补播一句
+    # 并复位本轮状态，避免设备一直亮红灯卡在「聆听中」。
+    # ------------------------------------------------------------------
+    def _cancel_listen_timeout(self, conn: "ConnectionHandler"):
+        task = getattr(conn, "_listen_timeout_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        conn._listen_timeout_task = None
+
+    @staticmethod
+    def _listen_timeout_float(conn: "ConnectionHandler", key: str, default: float) -> float:
+        try:
+            return float(conn.config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _start_listen_timeout(self, conn: "ConnectionHandler"):
+        """收到 listen start 后起表；功能关闭时行为与原来完全一致。"""
+        self._cancel_listen_timeout(conn)
+        if not conn.config.get("asr_listen_timeout_enabled", True):
+            return
+        sec = self._listen_timeout_float(conn, "asr_listen_timeout_sec", 15.0)
+        if sec <= 0:
+            return
+        # 新一轮聆听开始，上一轮的音频帧时刻不算数
+        conn._last_audio_frame_ts = None
+        conn._listen_timeout_task = asyncio.create_task(
+            self._listen_timeout_waiter(conn, sec)
+        )
+
+    async def _listen_timeout_waiter(self, conn: "ConnectionHandler", sec: float):
+        # 硬计时到点就播「没听清」踩过一次：现场用户连续说了 12.7s，VAD 没判停，
+        # 15s 到点插播兜底，5s 后 ASR 才把长句吐出来（日志：已等待=15s,
+        # 收到音频帧数=212）。所以到点只是「开始怀疑」，真正触发要求
+        # 「连续 quiet 秒没有新音频帧」，总时长上限 asr_listen_timeout_max_sec。
+        quiet = self._listen_timeout_float(conn, "asr_listen_timeout_quiet_sec", 3.0)
+        max_sec = self._listen_timeout_float(conn, "asr_listen_timeout_max_sec", 60.0)
+        waited = sec
+        since_last = None
+        try:
+            await asyncio.sleep(sec)
+            while quiet > 0:
+                last_ts = getattr(conn, "_last_audio_frame_ts", None)
+                if last_ts is None:
+                    # 一帧都没收到过：没什么可等的，直接兜底
+                    break
+                since_last = time.monotonic() - last_ts
+                if since_last >= quiet:
+                    break
+                if max_sec > 0 and waited >= max_sec:
+                    logger.bind(tag=TAG).warning(
+                        f"listen 超时顺延已达上限 {max_sec:.0f}s，仍在收音频，强制兜底"
+                    )
+                    break
+                extra = quiet - since_last
+                if max_sec > 0:
+                    extra = min(extra, max_sec - waited)
+                if extra <= 0:
+                    break
+                logger.bind(tag=TAG).info(
+                    f"listen 超时顺延: 已等待={waited:.0f}s, "
+                    f"最后一帧距今={since_last:.1f}s(<{quiet:.1f}s), 再等 {extra:.1f}s"
+                )
+                await asyncio.sleep(extra)
+                waited += extra
+        except asyncio.CancelledError:
+            # 正常取消（ASR出文本/voice_stop/client_abort/新一轮listen/连接关闭）
+            return
+        audio_frames = 0
+        try:
+            audio_frames = len(getattr(conn, "asr_audio", None) or [])
+            if getattr(conn, "client_abort", False):
+                logger.bind(tag=TAG).info("用户已打断，跳过listen超时兜底")
+                return
+            if conn.stop_event.is_set():
+                return
+            last_ts = getattr(conn, "_last_audio_frame_ts", None)
+            since_last = None if last_ts is None else time.monotonic() - last_ts
+            logger.bind(tag=TAG).warning(
+                f"listen 超时兜底: session_id={conn.session_id}, "
+                f"已等待={waited:.0f}s, 收到音频帧数={audio_frames}, "
+                f"最后一帧距今={'n/a' if since_last is None else format(since_last, '.1f') + 's'}, "
+                f"补播兜底话术"
+            )
+            # 话术：默认沿用 asr_empty_reply；显式空字符串 = 不播
+            reply = conn.config.get("asr_listen_timeout_reply")
+            if reply is None:
+                reply = conn.config.get("asr_empty_reply", "没听清，请再说一遍")
+            if reply:
+                self._speak_fallback_phrase(conn, reply)
+            # 复位本轮聆听状态，让设备播完能回到待命
+            conn.reset_audio_states()
+        except Exception as e:
+            logger.bind(tag=TAG).warning(f"listen 超时兜底执行失败: {e}")
 
     def _build_enhanced_text(self, text: str, speaker_name: Optional[str]) -> str:
         """构建包含说话人信息的文本（仅用于纯文本ASR）"""

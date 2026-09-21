@@ -16,6 +16,34 @@ TAG = __name__
 logger = setup_logging()
 
 
+def _content_at_eof(resp) -> bool:
+    """响应体是否已读完。aiohttp 3.x 的 StreamReader 有 at_eof()；测试替身没有。"""
+    content = getattr(resp, "content", None)
+    at_eof = getattr(content, "at_eof", None)
+    if at_eof is None:
+        return False
+    try:
+        return bool(at_eof())
+    except Exception:
+        return False
+
+
+def _connection_gone(resp) -> bool:
+    """底层连接是否已经没了（aiohttp 3.x：response.closed / response.connection）。"""
+    try:
+        if getattr(resp, "closed", False):
+            return True
+    except Exception:
+        pass
+    try:
+        # 连接释放后 connection 变 None；测试替身没有这个属性，缺省当作「还在」。
+        if hasattr(resp, "connection") and resp.connection is None:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _to_optional_int(v) -> Optional[int]:
     """Coerce a config value to int, or return None for empty/invalid."""
     if v is None:
@@ -123,6 +151,33 @@ class TTSProvider(TTSProviderBase):
         self.audio_format = "pcm"
         self.before_stop_play_files = []
 
+        # ---- OVS 会话槽节流参数 ----
+        # 现场 OVS 会话池只有 2 个全局槽（ASR 1 + TTS 1）。每句话一条 HTTP 流
+        # ⇒ 每轮问答被切成几句就抢几次槽。首句之后把分段合并成更少、更长的
+        # 请求，槽位争抢次数随之下降；首句仍按 base.py 的规则尽早出以保延迟。
+        self.subsequent_sentence_min_chars = int(
+            config.get("subsequent_sentence_min_chars", 32)
+        )
+        # 429（too_many_sessions）重试收敛：槽满时死等只会把这一轮堵死，
+        # 不如快速放弃交回上层。三个值都夹住最坏等待时间。
+        self.tts_max_retries = int(config.get("max_retries", 2))
+        self.retry_max_delay = float(config.get("retry_max_delay", 1.5))
+        self.retry_budget_seconds = float(config.get("retry_budget_seconds", 3.0))
+
+        # close() 后不再启动/继续任何在途流
+        self._closed = False
+
+        # ---- 非流式合成（to_tts）的帧采集 ----
+        # base.to_tts 期望 text_to_speak 返回音频字节，而本 provider 的
+        # text_to_speak 是流式的（返回 bool，音频经 handle_opus 进播放队列）。
+        # 唤醒词回应缓存（helloHandle.wakeupWordsResponse）走 to_tts，不覆写
+        # 就会每次失败 5 次，并且每次都真的向 OVS 发一条流、把帧塞进播放队列。
+        # 采集期间 handle_opus 改为把帧收进这个列表，不进 tts_audio_queue。
+        self._collect_frames = None
+        # 采集与流式播放共用同一个 provider 实例（各自在自己的线程里跑
+        # asyncio.run），没有锁的话两条流的帧会混进同一个列表。
+        self._synth_lock = threading.Lock()
+
         # Lazily created when we know the actual sample rate
         self.opus_encoder = None
         self.opus_sample_rate = None
@@ -163,6 +218,25 @@ class TTSProvider(TTSProviderBase):
         )
         self.opus_sample_rate = sample_rate
 
+    def _get_segment_text(self):
+        """首句沿用 base 规则；之后按最小字数合并，减少 TTS 流条数。
+
+        base.py 的后续句规则是「遇到句尾标点就切」，一段 LLM 回答常被切成
+        4~8 条 HTTP 流，每条都要抢一次 OVS 会话槽。这里改成：攒够
+        ``subsequent_sentence_min_chars`` 才发，否则继续缓冲；余文由
+        LAST 时的 ``_process_remaining_text_stream`` 排空，不会丢字。
+        """
+        if self.is_first_sentence:
+            return super()._get_segment_text()
+
+        full_text = "".join(self.tts_text_buff)
+        raw = full_text[self.processed_chars:]
+        if len(raw) < self.subsequent_sentence_min_chars:
+            return None
+        self.processed_chars = len(full_text)
+        segment_text = textUtils.get_string_no_punctuation_or_emoji(raw)
+        return segment_text or None
+
     def tts_text_priority_thread(self):
         """Streaming text processing thread."""
         while not self.conn.stop_event.is_set():
@@ -173,8 +247,13 @@ class TTSProvider(TTSProviderBase):
                 # 2) sentence_id 不属于当前活跃轮次的文本一并丢弃
                 # 否则旧轮的 LLM 文本会在新轮开始后继续被合成并推流。
                 if self.conn.client_abort:
+                    # 丢弃的同时清缓冲，否则下一轮会把上一轮的残文一起合成
+                    self.processed_chars = 0
+                    self.tts_text_buff = []
                     continue
                 if message.sentence_id and message.sentence_id != self.conn.sentence_id:
+                    self.processed_chars = 0
+                    self.tts_text_buff = []
                     continue
                 # 标记当前活跃轮次：handle_opus / text_to_speak 的音频入队都靠这个 tag，
                 # 这样 _audio_play_priority_thread 的 sentence_id 过滤才能识别 OVS 产出。
@@ -184,6 +263,9 @@ class TTSProvider(TTSProviderBase):
                     self.tts_stop_request = False
                     self.processed_chars = 0
                     self.tts_text_buff = []
+                    # 与 base.py:408 对齐：新一轮的首句要走首句规则（尽早出声），
+                    # 缺了它 OVS 子类会把整轮都当「后续句」缓冲，首音频被拖慢。
+                    self.is_first_sentence = True
                     self.before_stop_play_files.clear()
                 elif ContentType.TEXT == message.content_type:
                     self.tts_text_buff.append(message.content_detail)
@@ -219,7 +301,9 @@ class TTSProvider(TTSProviderBase):
             segment_text = textUtils.get_string_no_punctuation_or_emoji(remaining_text)
             if segment_text:
                 self.to_tts_single_stream(segment_text, is_last)
-                self.processed_chars += len(full_text)
+                # processed_chars 是「已消费的字符数」，不是增量：这里原先用
+                # += 会在多次调用后越界，后续文本被整段跳过。
+                self.processed_chars = len(full_text)
             else:
                 self._process_before_stop_play_files()
         else:
@@ -229,7 +313,8 @@ class TTSProvider(TTSProviderBase):
         try:
             text = MarkdownCleaner.clean_markdown(text)
             try:
-                succeeded = asyncio.run(self.text_to_speak(text, is_last))
+                with self._synth_lock:
+                    succeeded = asyncio.run(self.text_to_speak(text, is_last))
             except Exception as e:
                 logger.bind(tag=TAG).warning(
                     f"TTS generation failed: {text}, error: {e}"
@@ -249,11 +334,75 @@ class TTSProvider(TTSProviderBase):
         finally:
             return None
 
+    def to_tts(self, text):
+        """非流式合成：把整段音频采集成 opus 帧列表返回。
+
+        契约与 ``base.TTSProviderBase.to_tts`` 一致——返回 opus 帧 bytes 列表，
+        调用方（helloHandle.wakeupWordsResponse）用
+        ``opus_datas_to_wav_bytes(frames, sample_rate=conn.sample_rate)`` 解码。
+        失败返回 None（调用方对 None 直接 return），不抛。
+        """
+        frames = []
+        succeeded = False
+        try:
+            cleaned = MarkdownCleaner.clean_markdown(text)
+            with self._synth_lock:
+                self._collect_frames = frames
+                try:
+                    succeeded = asyncio.run(self.text_to_speak(cleaned, is_last=False))
+                finally:
+                    self._collect_frames = None
+        except Exception as e:
+            logger.bind(tag=TAG).warning(f"非流式语音生成失败: {text}，错误: {e}")
+            return None
+        if succeeded and frames:
+            logger.bind(tag=TAG).info(
+                f"非流式语音生成成功: {text}，{len(frames)} 帧"
+            )
+            return frames
+        logger.bind(tag=TAG).warning(
+            f"非流式语音生成无音频: {text}，succeeded={succeeded}, frames={len(frames)}"
+        )
+        return None
+
+    def handle_opus(self, opus_data: bytes):
+        """采集模式下收帧不入播放队列；其余情况沿用 base 行为。"""
+        collect = getattr(self, "_collect_frames", None)
+        if collect is not None:
+            collect.append(opus_data)
+            return
+        return super().handle_opus(opus_data)
+
     def _auth_headers(self) -> dict:
         """OVS 的鉴权头。OVS_API_KEYS 未启用时为空。"""
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
 
-    async def _post_with_retry(self, session, payload):
+    def _make_stop_checker(self, sid, ignore_round=False):
+        """返回一个「这条流是否该停」的判定函数。
+
+        都是简单 bool 读，跨线程直接读即可，不需要锁。
+        """
+
+        def _stopped():
+            if self._closed:
+                return True
+            conn = self.conn
+            if conn is None:
+                return False
+            if getattr(conn, "client_abort", False):
+                return True
+            stop_event = getattr(conn, "stop_event", None)
+            if stop_event is not None and stop_event.is_set():
+                return True
+            # 采集模式（to_tts）与对话轮次无关：此时的 sentence_id 只是上一轮
+            # 的残留，拿它做换轮判定会让唤醒词缓存合成永远被判为「过期」。
+            if not ignore_round and sid and sid != getattr(conn, "sentence_id", sid):
+                return True
+            return False
+
+        return _stopped
+
+    async def _post_with_retry(self, session, payload, stopped=None):
         """POST /tts/stream，对两类可恢复状态退避重试：
 
         - 503：OVS 正在热重载后端
@@ -265,9 +414,19 @@ class TTSProvider(TTSProviderBase):
         返回 response；最终失败返回 None。
         """
         delay = 0.1
-        max_delay = 5.0
-        max_retries = 3
+        max_delay = self.retry_max_delay
+        max_retries = self.tts_max_retries
+        # 整个重试阶段（含请求与读错误正文）共享一个 deadline。槽满是常态而非
+        # 偶发，等待时间必须有硬上界，否则这一轮的回答被整段堵死。
+        deadline = asyncio.get_event_loop().time() + self.retry_budget_seconds
         for attempt in range(max_retries + 1):
+            if stopped is not None and stopped():
+                return None
+            if asyncio.get_event_loop().time() >= deadline:
+                logger.bind(tag=TAG).warning(
+                    f"TTS retry budget {self.retry_budget_seconds}s exhausted"
+                )
+                return None
             resp = await session.post(
                 self.api_url, json=payload, headers=self._auth_headers()
             )
@@ -308,7 +467,16 @@ class TTSProvider(TTSProviderBase):
                 f"TTS {reason}: {status}, retry={attempt + 1}/{max_retries}, "
                 f"sleep={sleep_for:.1f}s"
             )
-            await asyncio.sleep(sleep_for)
+            # 分片睡，睡的过程中设备可能已经断开/换轮，没必要再回来发请求
+            loop = asyncio.get_event_loop()
+            sleep_for = min(sleep_for, max(0.0, deadline - loop.time()))
+            slept = 0.0
+            while slept < sleep_for:
+                if stopped is not None and stopped():
+                    return None
+                step = min(0.1, sleep_for - slept)
+                await asyncio.sleep(step)
+                slept += step
             delay = min(delay * 2, max_delay)
         return None
 
@@ -364,11 +532,35 @@ class TTSProvider(TTSProviderBase):
         if self.language is not None:
             payload["language"] = self.language
 
+        # 这条流属于哪一轮。设备断开 / 打断 / 换轮之后，在途的 HTTP 流必须立刻
+        # 放手——OVS 只有 2 个全局会话槽，一条合成完才释放意味着下一轮开口时
+        # 槽还被占着，直接 429。
+        sid = self.current_sentence_id
+        collecting = getattr(self, "_collect_frames", None) is not None
+        _stopped = self._make_stop_checker(sid, ignore_round=collecting)
+
+        if _stopped():
+            logger.bind(tag=TAG).info("TTS aborted before request (stale round)")
+            return False
+
         try:
-            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            # 整体上限由下面的 deadline 管，不交给 aiohttp：`total` 到期后
+            # aiohttp 的 TimerContext 会对之后每一次 await 持续抛
+            # asyncio.TimeoutError，与我们 250ms 轮询用的超时无法区分，
+            # 会被当成「还没数据」无限 continue（见下方 deadline 分支）。
+            timeout = aiohttp.ClientTimeout(
+                total=None,
+                sock_connect=min(5, self.timeout),
+                sock_read=self.timeout,
+            )
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                resp = await self._post_with_retry(session, payload)
+                resp = await self._post_with_retry(session, payload, stopped=_stopped)
                 if resp is None:
+                    if _stopped() or collecting:
+                        # 中止路径：收尾由上层（abort / 新一轮）负责，这里再补
+                        # 一个 LAST 只会给已经作废的轮次多推一帧。
+                        # 采集模式下这条流根本不属于任何播放轮次，更不该入队。
+                        return False
                     self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
                     return False
                 async with resp:
@@ -376,21 +568,51 @@ class TTSProvider(TTSProviderBase):
                         logger.bind(tag=TAG).error(
                             f"TTS request failed: {resp.status}, {await resp.text()}"
                         )
-                        self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
+                        if not collecting:
+                            self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
                         return False
 
                     self.pcm_buffer.clear()
-                    self.tts_audio_queue.put((SentenceType.FIRST, [], text, self.current_sentence_id))
+                    if not collecting:
+                        self.tts_audio_queue.put((SentenceType.FIRST, [], text, self.current_sentence_id))
 
                     # ---- Parse leading 4-byte LE sample rate header ----
                     header_buf = bytearray()
                     sample_rate = None
                     frame_bytes = None
 
-                    async for chunk in resp.content.iter_any():
+                    # 用带短超时的轮询读代替 `async for`：后者会一直挂在
+                    # readany() 上，设备断开后仍把整句合成完才释放会话槽。
+                    aborted = False
+                    loop = asyncio.get_event_loop()
+                    deadline = loop.time() + self.timeout
+                    while True:
+                        if _stopped():
+                            aborted = True
+                            break
+                        try:
+                            chunk = await asyncio.wait_for(
+                                resp.content.readany(), timeout=0.25
+                            )
+                        except asyncio.TimeoutError:
+                            # 只有「这 250ms 内没来数据」才该 continue。整体超时
+                            # 到点、流已 EOF、连接已断三种情况必须退出，否则这条
+                            # 循环会一直空转并占着 _synth_lock 与 OVS 会话槽。
+                            if (
+                                loop.time() >= deadline
+                                or _content_at_eof(resp)
+                                or _connection_gone(resp)
+                            ):
+                                logger.bind(tag=TAG).warning(
+                                    "TTS 流读取超时/连接已关闭，放弃本次合成"
+                                    f"（timeout={self.timeout}s）"
+                                )
+                                aborted = True
+                                break
+                            continue
                         data = chunk[0] if isinstance(chunk, (list, tuple)) else chunk
                         if not data:
-                            continue
+                            break  # EOF
 
                         # Accumulate header until we have 4 bytes
                         if sample_rate is None:
@@ -422,6 +644,15 @@ class TTSProvider(TTSProviderBase):
                                 frame, end_of_stream=False, callback=self.handle_opus
                             )
 
+                    if aborted:
+                        # 不 flush 尾音、不收尾播放文件：这一轮已经作废。
+                        # 退出 `async with resp` 会关掉连接，OVS 侧随即释放槽。
+                        self.pcm_buffer.clear()
+                        logger.bind(tag=TAG).info(
+                            "TTS stream aborted mid-flight; releasing OVS session slot"
+                        )
+                        return False
+
                     # Flush
                     if self.pcm_buffer and self.opus_encoder is not None:
                         self.opus_encoder.encode_pcm_to_opus_stream(
@@ -437,11 +668,18 @@ class TTSProvider(TTSProviderBase):
                     return True
 
         except Exception as e:
+            if _stopped():
+                logger.bind(tag=TAG).info(f"TTS stream aborted ({e})")
+                self.pcm_buffer.clear()
+                return False
             logger.bind(tag=TAG).error(f"TTS request exception: {e}")
-            self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
+            if not collecting:
+                self.tts_audio_queue.put((SentenceType.LAST, [], None, self.current_sentence_id))
             return False
 
     async def close(self):
+        # 先置位，让在途流在下一个 0.25s 轮询点自行退出
+        self._closed = True
         await super().close()
         if self.opus_encoder is not None:
             try:
