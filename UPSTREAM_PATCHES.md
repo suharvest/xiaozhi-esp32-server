@@ -449,11 +449,23 @@ depth>0 注入不会循环：`direct_answer` 的处理是「流式播报 + 写�
 **How**:
 1. `DEFAULT_MCP_TOOL_CALL_TIMEOUT = 8` 作为函数签名默认值，执行器从
    `conn.config["mcp_tool_call_timeout_sec"]` 取值传入。
-2. 超时不再 `raise TimeoutError`，改为返回
-   `{"ok": false, "executed": false, "say": "查询超时，请稍后再试",
-   "say_kind": "tell", "error": "tool_timeout"}` 的 JSON 字符串 —— 与备品 WMS
-   Provider 的返回体同构，LLM 按提示词第 9 条照搬 `say` 播报；同时打一条带
-   工具名与秒数的 WARNING。
+2. 超时不再 `raise TimeoutError`，改为返回一段与备品 WMS Provider 同构的 JSON
+   字符串 —— LLM 按提示词第 9 条照搬其中的 `say` 播报；同时打一条带工具名、
+   秒数与类别的 WARNING。
+   **`executed` 的语义按工具名分两类**（2026-09-21 补）：超时只删掉本地
+   Future（`mcp_endpoint_client.py` 的 `cleanup_call_result`），远端可能已经
+   执行完了，所以"超时"不等于"没执行"。
+   - **写操作**（名字命中 `stock_in|stock_out|move_|transfer|adjust|delete|
+     update|create`，以及两类正则都不命中、判断不了的）→
+     `{"ok": false, "executed": "unknown", "say": "操作超时，执行结果未知，
+     请先到系统里核对库存，再决定是否重试", "say_kind": "tell",
+     "error": "tool_timeout", "notice": "执行状态未知"}`。
+     `executed: "unknown"` 是字符串而非布尔，表示"远端执行状态不可知"：
+     LLM 不得播报"没有执行"，必须让用户先去系统核对再决定是否重试。
+   - **只读操作**（名字命中 `query_|search|resolve_|get_`）→ 保持
+     `executed: false` + "查询超时，请稍后再试"：重试无副作用。
+   分类函数 `is_write_tool()` / `timeout_result_for()` 在
+   `mcp_endpoint_handler.py` 里，默认保守归为写操作。
 3. `core/connection.py` 的 `CancelledError`（设备断开）降为 INFO，
    回给用户的兜底话术与上报行为不变。
 
@@ -461,7 +473,7 @@ depth>0 注入不会循环：`direct_answer` 的处理是「流式播报 + 写�
 读的是 `conn.config`，与 `tool_call_timeout`（上层 future 的总超时，仍是 30）
 是两个值：前者管单个 MCP 工具往返，后者管一轮里所有工具加起来。
 
-**Tests**: `main/xiaozhi-server/test/test_mcp_tool_timeout.py`（a/b/b2/b3/c/c2）。
+**Tests**: `main/xiaozhi-server/test/test_mcp_tool_timeout.py`（a/b/b2/b3/c/c2/d/e）。
 
 **Verify after merge**: `grep -n "DEFAULT_MCP_TOOL_CALL_TIMEOUT"
 core/providers/tools/mcp_endpoint/*.py` = 4 hits；

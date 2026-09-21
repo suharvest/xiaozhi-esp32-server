@@ -16,7 +16,9 @@
   (a) future 永不完成 → 到点返回含 tool_timeout 的 JSON 字符串，耗时≈超时值，
       且日志里有带工具名与秒数的 WARNING；
   (b) 配置 mcp_tool_call_timeout_sec: 2 经执行器生效（不是写死的默认值）；
-  (c) 正常完成不受影响，返回原文本、不产生超时结果。
+  (c) 正常完成不受影响，返回原文本、不产生超时结果；
+  (d) 写操作（及判断不了的）超时 → executed="unknown" + 核对话术；
+  (e) 只读操作超时 → executed=False + 原查询话术。
 """
 import asyncio
 import json
@@ -221,6 +223,53 @@ def test_c2_normal_call_through_executor():
     assert resp.result == "库存137件", resp.result
 
 
+
+# ── (d/e) 超时的 executed 语义按工具名分类 ──
+
+class AnyToolClient(FakeClient):
+    """has_tool 对任何名字都返回 True，用来跑不同工具名的超时分支。"""
+
+    def has_tool(self, name):
+        return True
+
+
+def test_d_write_tool_timeout_is_unknown():
+    """写操作超时：远端可能已经执行，不能告诉用户「没执行」。"""
+    captured.clear()
+    for name in ("stock_in", "stock_out", "move_item", "adjust_qty", "wms_unknown_op"):
+        client = AnyToolClient(reply=None)
+        result = _run(H.call_mcp_endpoint_tool(client, name, "{}", timeout=1))
+        payload = json.loads(result)
+        assert payload["executed"] == "unknown", (name, payload)
+        assert payload["ok"] is False, (name, payload)
+        assert payload["error"] == "tool_timeout", (name, payload)
+        assert payload["notice"] == "执行状态未知", (name, payload)
+        assert payload["say"] == (
+            "操作超时，执行结果未知，请先到系统里核对库存，再决定是否重试"
+        ), (name, payload)
+        assert payload["say_kind"] == "tell", (name, payload)
+    warns = [m for m in captured if "stock_in" in m]
+    assert warns, captured
+    assert "写操作" in warns[0], warns[0]
+    print("(d) 写操作/无法判断的工具超时 → executed=unknown  ✓")
+
+
+def test_e_read_tool_timeout_stays_false():
+    """只读操作超时：重试无副作用，executed=False 是安全的说法。"""
+    captured.clear()
+    for name in ("query_stock", "search_item", "resolve_sku", "get_location"):
+        client = AnyToolClient(reply=None)
+        result = _run(H.call_mcp_endpoint_tool(client, name, "{}", timeout=1))
+        payload = json.loads(result)
+        assert payload["executed"] is False, (name, payload)
+        assert payload["say"] == "查询超时，请稍后再试", (name, payload)
+        assert "notice" not in payload, (name, payload)
+    warns = [m for m in captured if "query_stock" in m]
+    assert warns, captured
+    assert "只读操作" in warns[0], warns[0]
+    print("(e) 只读工具超时 → executed=False，话术不变  ✓")
+
+
 if __name__ == "__main__":
     test_a_timeout_returns_speakable_result()
     test_b_config_timeout_applies()
@@ -228,4 +277,6 @@ if __name__ == "__main__":
     test_b3_config_yaml_ships_the_key()
     test_c_normal_call_unaffected()
     test_c2_normal_call_through_executor()
+    test_d_write_tool_timeout_is_unknown()
+    test_e_read_tool_timeout_stays_false()
     print("\n全部通过 ✓")
