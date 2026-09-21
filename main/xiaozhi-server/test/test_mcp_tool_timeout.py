@@ -175,15 +175,21 @@ def test_b3_config_yaml_ships_the_key():
     拿它来断言等于拿现场配置卡仓库的默认值。运行期不依赖这个键——
     没配就用 DEFAULT_MCP_TOOL_CALL_TIMEOUT。
     """
-    if "__file__" not in globals():
+    # stdin 跑法下 __file__ 是 "<stdin>"（不是「没有 __file__」，踩过），
+    # 只有真正指向本文件的 .py 路径才能推出仓库根。
+    here = globals().get("__file__", "")
+    if not here.endswith(".py") or not os.path.isfile(here):
         print("skip test_b3: stdin 跑法没有仓库路径")
         return
 
     import yaml
 
     cfg_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml"
+        os.path.dirname(os.path.dirname(os.path.abspath(here))), "config.yaml"
     )
+    if not os.path.isfile(cfg_path):
+        print("skip test_b3: 找不到仓库 config.yaml")
+        return
     cfg = yaml.safe_load(open(cfg_path, encoding="utf-8"))
     assert cfg.get("mcp_tool_call_timeout_sec") == 8, cfg.get("mcp_tool_call_timeout_sec")
 
